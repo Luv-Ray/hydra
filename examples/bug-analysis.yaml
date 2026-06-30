@@ -13,9 +13,7 @@ steps:
   # 2. 多路审查：只拿结论，各自独立
   - id: security_review
     output_from: investigate
-    inject:
-      - text: "你是一位安全专家。"
-    prompt: "从安全角度审查上述分析和修复方案。找出潜在的安全风险。"
+    prompt: "你是一位安全专家。从安全角度审查上述分析和修复方案。找出潜在的安全风险。"
     output: "reports/security.md"
 
   - id: perf_review

@@ -22,7 +22,7 @@ def build_prompt(
     # output_from mode: inject parent's output as context
     if step.output_from:
         parent = results[step.output_from]
-        parts.append(f"以下是之前的分析结果：\n\n{parent.output_text}")
+        parts.append(f"[Output of step: {step.output_from}]\n{parent.output_text}")
 
     # inject content
     for inj in step.inject:
@@ -30,15 +30,13 @@ def build_prompt(
 
         if inj.type == InjectType.OUTPUT_OF:
             ref = results[inj.value]
-            parts.append(f"[{inj.value} 的输出]\n{ref.output_text}")
+            parts.append(f"[Output of step: {inj.value}]\n{ref.output_text}")
         elif inj.type == InjectType.FILE:
             file_path = inj.value
             if workdir and not os.path.isabs(file_path):
                 file_path = str(Path(workdir) / file_path)
             content = Path(file_path).read_text()
-            parts.append(f"[文件: {inj.value}]\n{content}")
-        elif inj.type == InjectType.TEXT:
-            parts.append(inj.value)
+            parts.append(f"[File: {inj.value}]\n{content}")
 
     if parts:
         prefix = "\n\n---\n\n".join(parts)

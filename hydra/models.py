@@ -12,7 +12,6 @@ import yaml
 class InjectType(Enum):
     OUTPUT_OF = "output_of"
     FILE = "file"
-    TEXT = "text"
 
 
 @dataclass
@@ -26,8 +25,6 @@ class InjectDef:
             return cls(type=InjectType.OUTPUT_OF, value=d["output_of"])
         elif "file" in d:
             return cls(type=InjectType.FILE, value=d["file"])
-        elif "text" in d:
-            return cls(type=InjectType.TEXT, value=d["text"])
         raise ValueError(f"Unknown inject type: {d}")
 
 
@@ -37,6 +34,7 @@ class StepDef:
     prompt: str
     fork_from: str | None = None
     output_from: str | None = None
+    after: list[str] = field(default_factory=list)
     inject: list[InjectDef] = field(default_factory=list)
     compact: bool = False
     output: str | None = None
@@ -52,6 +50,11 @@ class StepDef:
             prompt=d["prompt"],
             fork_from=d.get("fork_from"),
             output_from=d.get("output_from"),
+            after=(
+                d.get("after", [])
+                if isinstance(d.get("after"), list)
+                else [d["after"]] if d.get("after") else []
+            ),
             inject=injects,
             compact=d.get("compact", False),
             output=d.get("output"),

@@ -14,6 +14,7 @@ def build_dag(steps: list[StepDef]) -> dict[str, list[str]]:
             step_deps.append(step.fork_from)
         if step.output_from:
             step_deps.append(step.output_from)
+        step_deps.extend(step.after)
         for inj in step.inject:
             if inj.type == InjectType.OUTPUT_OF:
                 step_deps.append(inj.value)
@@ -34,9 +35,7 @@ def topological_layers(
     layers: list[list[str]] = []
 
     while pending:
-        layer = [
-            sid for sid in pending if all(d in resolved for d in dag.get(sid, []))
-        ]
+        layer = [sid for sid in pending if all(d in resolved for d in dag.get(sid, []))]
         if not layer:
             raise ValueError(f"Circular dependency detected among: {pending}")
         layers.append(layer)

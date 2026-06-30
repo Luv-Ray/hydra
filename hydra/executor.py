@@ -99,9 +99,7 @@ async def execute_dag(task: TaskDef) -> dict[str, StepResult]:
             step = step_map[layer[0]]
             results[layer[0]] = await execute_step(step, results, task)
         else:
-            coros = [
-                execute_step(step_map[sid], results, task) for sid in layer
-            ]
+            coros = [execute_step(step_map[sid], results, task) for sid in layer]
             layer_results = await asyncio.gather(*coros)
             for sid, result in zip(layer, layer_results):
                 results[sid] = result
