@@ -35,8 +35,8 @@ class InjectDef:
 class StepDef:
     id: str
     prompt: str
-    continue_from: str | None = None
-    context: str | None = None
+    fork_from: str | None = None
+    output_from: str | None = None
     inject: list[InjectDef] = field(default_factory=list)
     compact: bool = False
     output: str | None = None
@@ -50,8 +50,8 @@ class StepDef:
         return cls(
             id=d["id"],
             prompt=d["prompt"],
-            continue_from=d.get("continue"),
-            context=d.get("context"),
+            fork_from=d.get("fork_from"),
+            output_from=d.get("output_from"),
             inject=injects,
             compact=d.get("compact", False),
             output=d.get("output"),

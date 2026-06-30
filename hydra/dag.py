@@ -10,10 +10,10 @@ def build_dag(steps: list[StepDef]) -> dict[str, list[str]]:
     deps: dict[str, list[str]] = {}
     for step in steps:
         step_deps: list[str] = []
-        if step.continue_from:
-            step_deps.append(step.continue_from)
-        if step.context:
-            step_deps.append(step.context)
+        if step.fork_from:
+            step_deps.append(step.fork_from)
+        if step.output_from:
+            step_deps.append(step.output_from)
         for inj in step.inject:
             if inj.type == InjectType.OUTPUT_OF:
                 step_deps.append(inj.value)

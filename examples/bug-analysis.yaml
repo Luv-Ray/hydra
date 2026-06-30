@@ -12,25 +12,25 @@ steps:
 
   # 2. 多路审查：只拿结论，各自独立
   - id: security_review
-    context: investigate
+    output_from: investigate
     inject:
       - text: "你是一位安全专家。"
     prompt: "从安全角度审查上述分析和修复方案。找出潜在的安全风险。"
     output: "reports/security.md"
 
   - id: perf_review
-    context: investigate
+    output_from: investigate
     prompt: "从性能角度审查修复方案。高并发下是否有问题？"
     output: "reports/perf.md"
 
   - id: correctness_review
-    context: investigate
+    output_from: investigate
     prompt: "构造边界条件和极端场景，找出方案中的逻辑漏洞。"
     output: "reports/correctness.md"
 
   # 3. 综合：继承完整上下文 + 注入审查结论
   - id: final_fix
-    continue: investigate
+    fork_from: investigate
     inject:
       - output_of: security_review
       - output_of: perf_review

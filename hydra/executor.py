@@ -52,9 +52,9 @@ async def execute_step(
     if task.workdir:
         options.cwd = str(Path(task.workdir).resolve())
 
-    # continue mode: fork the parent session
-    if step.continue_from:
-        parent = results[step.continue_from]
+    # fork_from mode: fork the parent session
+    if step.fork_from:
+        parent = results[step.fork_from]
         options.resume = parent.session_id
         options.fork_session = True
 

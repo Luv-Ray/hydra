@@ -19,9 +19,9 @@ def build_prompt(
     """Build the full prompt for a step: inject prefix + context prefix + step prompt."""
     parts: list[str] = []
 
-    # context mode: inject parent's output as context
-    if step.context:
-        parent = results[step.context]
+    # output_from mode: inject parent's output as context
+    if step.output_from:
+        parent = results[step.output_from]
         parts.append(f"以下是之前的分析结果：\n\n{parent.output_text}")
 
     # inject content
