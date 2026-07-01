@@ -1,41 +1,66 @@
-"""DAG construction and topological sort from step references."""
+"""DAG construction and topological sort for Hydra pipelines."""
 
 from __future__ import annotations
 
-from .models import InjectType, StepDef
+from .models import Pipeline, StepDef
 
 
-def build_dag(steps: list[StepDef]) -> dict[str, list[str]]:
-    """Build dependency graph: step_id -> list of dependency step_ids."""
+def build_dag(pipeline: Pipeline) -> dict[str, list[str]]:
+    """Build dependency graph: step_id -> list of dependency step_ids.
+
+    Dependency sources (union):
+    1. resume: X → depends on X
+    2. after: [X, Y] → explicit dependencies
+    3. inject precise file matching a step's output → auto dependency
+       (only if producer appears before consumer in YAML order,
+        to avoid creating cycles in goto-backjump scenarios)
+    """
+    output_map = {s.output: s.id for s in pipeline.steps if s.output}
+    step_order = {s.id: i for i, s in enumerate(pipeline.steps)}
     deps: dict[str, list[str]] = {}
-    for step in steps:
+
+    for step in pipeline.steps:
         step_deps: list[str] = []
-        if step.fork_from:
-            step_deps.append(step.fork_from)
-        if step.output_from:
-            step_deps.append(step.output_from)
+
+        if step.resume:
+            step_deps.append(step.resume)
+
         step_deps.extend(step.after)
-        for inj in step.inject:
-            if inj.type == InjectType.OUTPUT_OF:
-                step_deps.append(inj.value)
+
+        for path in step.inject:
+            if "*" in path or "?" in path:
+                continue
+            if path in output_map and output_map[path] != step.id:
+                dep_id = output_map[path]
+                # Only add if producer is declared before consumer (avoids back-edges)
+                if step_order[dep_id] < step_order[step.id] and dep_id not in step_deps:
+                    step_deps.append(dep_id)
+
         deps[step.id] = step_deps
+
     return deps
 
 
 def topological_layers(
-    steps: list[StepDef], dag: dict[str, list[str]]
+    pipeline: Pipeline, dag: dict[str, list[str]]
 ) -> list[list[str]]:
     """Return steps grouped into layers that can execute concurrently.
 
-    Each layer contains step IDs whose dependencies are all in prior layers.
+    Only includes steps with trigger=dag. Steps with trigger=route are
+    excluded from DAG scheduling (reached only via goto).
     Raises ValueError on circular dependency.
     """
+    dag_steps = [s.id for s in pipeline.steps if s.trigger == "dag"]
     resolved: set[str] = set()
-    pending = [s.id for s in steps]
+    pending = list(dag_steps)
     layers: list[list[str]] = []
 
     while pending:
-        layer = [sid for sid in pending if all(d in resolved for d in dag.get(sid, []))]
+        layer = [
+            sid
+            for sid in pending
+            if all(d in resolved or d not in set(dag_steps) for d in dag.get(sid, []))
+        ]
         if not layer:
             raise ValueError(f"Circular dependency detected among: {pending}")
         layers.append(layer)

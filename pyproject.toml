@@ -1,15 +1,22 @@
 [project]
 name = "hydra"
-version = "0.1.0"
-description = "AI agent orchestration engine with context forking"
+version = "1.0.0"
+description = "AI agent orchestration engine"
 requires-python = ">=3.10"
 dependencies = [
     "claude-agent-sdk",
     "pyyaml>=6.0",
+    "click>=8.0",
 ]
 
 [project.scripts]
 hydra = "hydra.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+]
 
 [build-system]
 requires = ["setuptools>=68.0"]

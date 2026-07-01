@@ -1,0 +1,31 @@
+name: feishu-mcp-test
+version: 1
+
+defaults:
+  allowed_tools: [Read, Write, Bash, mcp__mcp-filter-proxy__doc_create]
+
+mcp_servers:
+  feishu-mcp-pro:
+    command: npx
+    args:
+      - "-y"
+      - "--registry=https://pkgs.d.xiaomi.net/artifactory/api/npm/mi-npm/"
+      - "@mi/feishu-mcp-pro@latest"
+
+workdir: /tmp/hydra-feishu-test
+
+steps:
+  - id: create_doc
+    prompt: |
+      使用 mcp__mcp-filter-proxy__doc_create 工具创建一个飞书文档。
+      标题为 "Hydra MCP Test"，内容为：
+
+      # Hydra MCP 集成测试
+
+      这是 Hydra pipeline 引擎通过 MCP 自动创建的飞书文档。
+
+      - 时间：自动生成
+      - 来源：hydra run examples/feishu-mcp-test.yaml
+
+      创建成功后，输出文档的 URL。
+    output: result.md

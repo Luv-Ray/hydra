@@ -1,103 +1,148 @@
-"""DSL data models for Hydra task definitions."""
+"""DSL v1 data models for Hydra pipeline definitions."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Union
-
-import yaml
-
-
-class InjectType(Enum):
-    OUTPUT_OF = "output_of"
-    FILE = "file"
+from typing import Any
 
 
 @dataclass
-class InjectDef:
-    type: InjectType
-    value: str
+class InputDef:
+    description: str = ""
+    required: bool = False
+    default: str | None = None
 
     @classmethod
-    def from_dict(cls, d: dict) -> "InjectDef":
-        if "output_of" in d:
-            return cls(type=InjectType.OUTPUT_OF, value=d["output_of"])
-        elif "file" in d:
-            return cls(type=InjectType.FILE, value=d["file"])
-        raise ValueError(f"Unknown inject type: {d}")
+    def from_dict(cls, d: dict[str, Any]) -> InputDef:
+        return cls(
+            description=d.get("description", ""),
+            required=d.get("required", False),
+            default=d.get("default"),
+        )
+
+
+@dataclass
+class DefaultsDef:
+    model: str | None = None
+    retry: int = 0
+    timeout: int = 300
+    max_iterations: int = 10
+    allowed_tools: list[str] | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> DefaultsDef:
+        return cls(
+            model=d.get("model"),
+            retry=d.get("retry", 0),
+            timeout=d.get("timeout", 300),
+            max_iterations=d.get("max_iterations", 10),
+            allowed_tools=d.get("allowed_tools"),
+        )
+
+
+@dataclass
+class CheckRouteDef:
+    match: str
+    goto: str | list[str]
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> CheckRouteDef:
+        return cls(match=d["match"], goto=d["goto"])
+
+
+@dataclass
+class CheckDef:
+    prompt: str
+    success_pattern: str | None = None
+    routes: list[CheckRouteDef] | None = None
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> CheckDef:
+        routes = None
+        if "routes" in d:
+            routes = [CheckRouteDef.from_dict(r) for r in d["routes"]]
+        return cls(
+            prompt=d["prompt"],
+            success_pattern=d.get("success_pattern"),
+            routes=routes,
+        )
+
+
+@dataclass
+class RouteDef:
+    condition: str  # "success" | "failure"
+    goto: str | list[str]  # step_id, [step_ids], "$end", "$fail"
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> RouteDef:
+        return cls(condition=d["if"], goto=d["goto"])
 
 
 @dataclass
 class StepDef:
     id: str
     prompt: str
-    fork_from: str | None = None
-    output_from: str | None = None
-    after: list[str] = field(default_factory=list)
-    inject: list[InjectDef] = field(default_factory=list)
-    compact: bool = False
     output: str | None = None
+    after: list[str] = field(default_factory=list)
+    inject: list[str] = field(default_factory=list)
+    resume: str | None = None
     model: str | None = None
-    max_turns: int | None = None
+    retry: int | None = None
+    retry_inject: str | None = None  # "last_output" | "check_output"
+    timeout: int | None = None
     allowed_tools: list[str] | None = None
+    max_turns: int | None = None
+    max_iterations: int | None = None
+    routes: list[RouteDef] | None = None
+    check: CheckDef | None = None
+    when: str | None = None
+    trigger: str = "dag"  # "dag" | "route"
 
     @classmethod
-    def from_dict(cls, d: dict) -> "StepDef":
-        injects = [InjectDef.from_dict(i) for i in d.get("inject", [])]
+    def from_dict(cls, d: dict[str, Any]) -> StepDef:
+        after = d.get("after", [])
+        if isinstance(after, str):
+            after = [after]
+
+        inject = d.get("inject", [])
+        if isinstance(inject, str):
+            inject = [inject]
+
+        routes = None
+        if "routes" in d:
+            routes = [RouteDef.from_dict(r) for r in d["routes"]]
+
+        check = None
+        if "check" in d:
+            check = CheckDef.from_dict(d["check"])
+
         return cls(
             id=d["id"],
             prompt=d["prompt"],
-            fork_from=d.get("fork_from"),
-            output_from=d.get("output_from"),
-            after=(
-                d.get("after", [])
-                if isinstance(d.get("after"), list)
-                else [d["after"]] if d.get("after") else []
-            ),
-            inject=injects,
-            compact=d.get("compact", False),
             output=d.get("output"),
+            after=after,
+            inject=inject,
+            resume=d.get("resume"),
             model=d.get("model"),
-            max_turns=d.get("max_turns"),
+            retry=d.get("retry"),
+            retry_inject=d.get("retry_inject"),
+            timeout=d.get("timeout"),
             allowed_tools=d.get("allowed_tools"),
+            max_turns=d.get("max_turns"),
+            max_iterations=d.get("max_iterations"),
+            routes=routes,
+            check=check,
+            when=d.get("when"),
+            trigger=d.get("trigger", "dag"),
         )
 
 
 @dataclass
-class McpServerDef:
-    command: str
-    args: list[str] = field(default_factory=list)
-    env: dict[str, str] = field(default_factory=dict)
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "McpServerDef":
-        return cls(
-            command=d["command"],
-            args=d.get("args", []),
-            env=d.get("env", {}),
-        )
-
-
-@dataclass
-class TaskDef:
+class Pipeline:
     name: str
+    version: int
     steps: list[StepDef]
+    inputs: dict[str, InputDef] = field(default_factory=dict)
+    defaults: DefaultsDef = field(default_factory=DefaultsDef)
     workdir: str | None = None
-    mcp_servers: dict[str, McpServerDef] = field(default_factory=dict)
-
-    @classmethod
-    def from_yaml(cls, path: str) -> "TaskDef":
-        with open(path) as f:
-            data = yaml.safe_load(f)
-        steps = [StepDef.from_dict(s) for s in data["steps"]]
-        mcp = {
-            name: McpServerDef.from_dict(cfg)
-            for name, cfg in data.get("mcp_servers", {}).items()
-        }
-        return cls(
-            name=data["name"],
-            steps=steps,
-            workdir=data.get("workdir"),
-            mcp_servers=mcp,
-        )
+    mcp_servers: dict[str, Any] = field(default_factory=dict)

@@ -1,36 +1,114 @@
-"""CLI entry point for Hydra."""
+"""CLI entry point for Hydra pipeline execution."""
 
 from __future__ import annotations
 
 import asyncio
 import sys
-import time
 
-from .executor import execute_dag
-from .models import TaskDef
+import click
+
+from .errors import ExecutionError, HydraError, ValidationError
+from .executor import ExecutionEngine
+from .loader import load_pipeline
+from .validate import validate_pipeline
 
 
-async def run(task_file: str) -> None:
-    task = TaskDef.from_yaml(task_file)
-    print(f"[hydra] Running task: {task.name}")
-    print(f"[hydra] Steps: {[s.id for s in task.steps]}")
+@click.group()
+def cli() -> None:
+    """Hydra — AI agent orchestration engine."""
 
-    start = time.time()
-    results = await execute_dag(task)
-    elapsed = time.time() - start
 
-    print(f"\n[hydra] Completed {len(results)} steps in {elapsed:.1f}s")
-    for step_id, result in results.items():
-        preview = result.output_text[:80].replace("\n", " ")
-        print(f"  {step_id}: {preview}...")
+@cli.command()
+@click.argument("pipeline_file", type=click.Path(exists=True))
+@click.option("--var", multiple=True, help="Input variable: key=value")
+@click.option("--var-file", type=click.Path(exists=True), help="YAML file with input variables")
+@click.option("--concurrency", type=int, default=0, help="Max concurrent steps (0=unlimited)")
+@click.option("--dry-run", is_flag=True, help="Show execution plan without running")
+@click.option("-v", "--verbose", is_flag=True, help="Verbose logging (include assistant text)")
+def run(
+    pipeline_file: str,
+    var: tuple[str, ...],
+    var_file: str | None,
+    concurrency: int,
+    dry_run: bool,
+    verbose: bool,
+) -> None:
+    """Execute a pipeline."""
+    vars_dict = _parse_vars(var)
+
+    try:
+        pipeline = load_pipeline(pipeline_file, vars=vars_dict, var_file=var_file)
+        warnings = validate_pipeline(pipeline)
+        for w in warnings:
+            click.echo(f"[hydra] warning: {w}", err=True)
+
+        engine = ExecutionEngine(
+            pipeline=pipeline,
+            inputs=vars_dict,
+            concurrency=concurrency,
+            dry_run=dry_run,
+            verbose=verbose,
+        )
+        result = asyncio.run(engine.run())
+
+        if result == "failure":
+            sys.exit(1)
+
+    except ValidationError as e:
+        click.echo(f"[hydra] validation error: {e}", err=True)
+        sys.exit(2)
+    except ExecutionError as e:
+        click.echo(f"[hydra] execution error: {e}", err=True)
+        sys.exit(1)
+    except HydraError as e:
+        click.echo(f"[hydra] error: {e}", err=True)
+        sys.exit(1)
+
+
+@cli.command()
+@click.argument("pipeline_file", type=click.Path(exists=True))
+@click.option("--var", multiple=True, help="Input variable: key=value")
+@click.option("--var-file", type=click.Path(exists=True), help="YAML file with input variables")
+def validate(
+    pipeline_file: str,
+    var: tuple[str, ...],
+    var_file: str | None,
+) -> None:
+    """Validate a pipeline file without executing."""
+    vars_dict = _parse_vars(var)
+
+    try:
+        pipeline = load_pipeline(pipeline_file, vars=vars_dict, var_file=var_file)
+        warnings = validate_pipeline(pipeline)
+
+        click.echo(f"Pipeline '{pipeline.name}' is valid.")
+        click.echo(f"  Steps: {len(pipeline.steps)}")
+        click.echo(f"  DAG steps: {sum(1 for s in pipeline.steps if s.trigger == 'dag')}")
+        click.echo(f"  Route steps: {sum(1 for s in pipeline.steps if s.trigger == 'route')}")
+
+        if warnings:
+            click.echo()
+            for w in warnings:
+                click.echo(f"  warning: {w}")
+
+    except ValidationError as e:
+        click.echo(f"Validation error: {e}", err=True)
+        sys.exit(2)
+    except HydraError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(2)
+
+
+def _parse_vars(var_args: tuple[str, ...]) -> dict[str, str]:
+    """Parse --var key=value arguments into a dict."""
+    result: dict[str, str] = {}
+    for item in var_args:
+        if "=" not in item:
+            raise click.BadParameter(f"Invalid --var format: '{item}' (expected key=value)")
+        key, value = item.split("=", 1)
+        result[key.strip()] = value.strip()
+    return result
 
 
 def main() -> None:
-    if len(sys.argv) < 2:
-        print("Usage: hydra <task.yaml>", file=sys.stderr)
-        sys.exit(1)
-    asyncio.run(run(sys.argv[1]))
-
-
-if __name__ == "__main__":
-    main()
+    cli()
