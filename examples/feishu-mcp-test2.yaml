@@ -1,0 +1,17 @@
+name: feishu-mcp-test
+version: 1
+
+defaults:
+  allowed_tools: [Read, Write, Bash]
+
+workdir: /tmp/hydra-feishu-test2
+
+steps:
+  - id: create_doc
+    prompt: |
+      创建一个飞书文档，标题为 "Hydra MCP Test 2"，内容为：
+
+      # 简化测试
+
+      这次没有在 YAML 里声明 mcp_servers，验证 SDK 自动读取全局 MCP 配置。
+    output: result.md

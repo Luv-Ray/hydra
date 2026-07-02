@@ -18,7 +18,7 @@
 
 ## 设计文档
 
-详细 DSL 规范见 `docs/specs/2026-07-01-dsl-design.md`。
+完整 DSL 关键字与语义参考见 [`specs/dsl-reference.md`](specs/dsl-reference.md)(以代码为准,持续维护)。
 
 ## 架构
 
@@ -39,7 +39,7 @@ YAML pipeline
      │
      ├── provider.py    ← Claude Agent SDK 调用
      ├── inject.py      ← 文件注入
-     ├── check.py       ← 结果验证
+     ├── events.py      ← 结构化事件流(控制流可观测性)
      └── persistence.py ← .hydra/runs/ 持久化
 ```
 

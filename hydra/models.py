@@ -52,7 +52,7 @@ class CheckRouteDef:
 
 @dataclass
 class CheckDef:
-    prompt: str
+    prompt: str | None = None
     success_pattern: str | None = None
     routes: list[CheckRouteDef] | None = None
 
@@ -62,7 +62,7 @@ class CheckDef:
         if "routes" in d:
             routes = [CheckRouteDef.from_dict(r) for r in d["routes"]]
         return cls(
-            prompt=d["prompt"],
+            prompt=d.get("prompt"),
             success_pattern=d.get("success_pattern"),
             routes=routes,
         )
@@ -86,6 +86,7 @@ class StepDef:
     after: list[str] = field(default_factory=list)
     inject: list[str] = field(default_factory=list)
     resume: str | None = None
+    compact_before_resume: int | None = None  # % of context window; over this, /compact the resume target first
     model: str | None = None
     retry: int | None = None
     retry_inject: str | None = None  # "last_output" | "check_output"
@@ -123,6 +124,7 @@ class StepDef:
             after=after,
             inject=inject,
             resume=d.get("resume"),
+            compact_before_resume=d.get("compact_before_resume"),
             model=d.get("model"),
             retry=d.get("retry"),
             retry_inject=d.get("retry_inject"),

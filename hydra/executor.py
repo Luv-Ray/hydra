@@ -9,11 +9,21 @@ from typing import Any
 
 from .dag import build_dag, topological_layers
 from .errors import ExecutionError
+from .events import EventLog
 from .expr import eval_when
-from .inject import build_prompt
+from .inject import build_prompt, count_inject
 from .models import Pipeline, StepDef
 from .persistence import RunStore
 from .provider import ClaudeProvider, Provider, StepResult, StepRunOptions
+
+
+def _last_nonempty_line(text: str) -> str:
+    """Return the last non-blank line of ``text`` (stripped), or "" if none."""
+    for line in reversed((text or "").splitlines()):
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
 
 
 class ExecutionEngine:
@@ -39,6 +49,8 @@ class ExecutionEngine:
         self.results: dict[str, StepResult] = {}
         self.skipped: set[str] = set()
         self.iteration_counts: dict[str, int] = {}
+        # Total times each step has been executed (for non-overwriting persistence)
+        self.execution_counts: dict[str, int] = {}
 
         workdir = pipeline.workdir
         if workdir and not Path(workdir).is_absolute():
@@ -47,6 +59,10 @@ class ExecutionEngine:
 
         self._semaphore = asyncio.Semaphore(concurrency) if concurrency > 0 else None
         self.store: RunStore | None = None
+        self.events = EventLog()
+        # Serialize compaction per resume-target so parallel steps that resume
+        # the same session compact it at most once (see _maybe_compact).
+        self._compact_locks: dict[str, asyncio.Lock] = {}
 
     async def run(self) -> str:
         """Execute the pipeline. Returns 'success' or 'failure'."""
@@ -60,6 +76,12 @@ class ExecutionEngine:
         # Initialize persistence
         base_dir = self.workdir or str(Path.cwd())
         self.store = RunStore(base_dir, self.pipeline.name, self.inputs, self.workdir)
+        self.events = EventLog(self.store.run_dir)
+        # Detailed agent logs (prompts, tool/shell calls, check I/O) go to a file
+        # in the run dir — kept out of the live stderr stream, which now carries
+        # only control-flow events. See ClaudeProvider.set_trace_file.
+        if isinstance(self.provider, ClaudeProvider):
+            self.provider.set_trace_file(self.store.run_dir / "agent-trace.log")
 
         # Build DAG and execute
         dag = build_dag(self.pipeline)
@@ -71,12 +93,27 @@ class ExecutionEngine:
                 if not active:
                     continue
                 await self._execute_layer(active)
-        except ExecutionError:
+        except ExecutionError as e:
             self.store.save_result("failure")
+            self.events.pipeline_done(status="failure", reason=str(e))
             return "failure"
 
         self.store.save_result("success")
+        self.events.pipeline_done(
+            status="success", reason=self._terminal_reason()
+        )
         return "success"
+
+    def _terminal_reason(self) -> str:
+        """Describe how the pipeline reached its successful end."""
+        # The last route-triggered step (e.g. final_report) is the natural end.
+        route_done = [
+            s.id for s in self.pipeline.steps
+            if s.trigger == "route" and s.id in self.results
+        ]
+        if route_done:
+            return f"reached {route_done[-1]}"
+        return "all steps completed"
 
     async def _execute_layer(self, step_ids: list[str]) -> None:
         """Execute a layer of steps concurrently."""
@@ -98,9 +135,20 @@ class ExecutionEngine:
 
     async def _execute_step_inner(self, step: StepDef) -> None:
         """Core step execution logic."""
-        print(f"[hydra] running: {step.id}", file=sys.stderr)
+        execution = self.execution_counts.get(step.id, 0) + 1
+        self.execution_counts[step.id] = execution
+
+        resume_id = step.resume if (step.resume and step.resume in self.results) else None
+        self.events.step_start(
+            step.id, trigger=step.trigger, execution=execution,
+            resume=resume_id, inject_count=count_inject(step.inject, self.workdir),
+        )
         if self.store:
-            self.store.save_step_start(step.id)
+            self.store.save_step_start(step.id, execution)
+
+        # Before resuming a heavy session, compact it in place (like /compact in
+        # the CLI) so this step continues on a lighter context.
+        await self._maybe_compact(step)
 
         max_retries = step.retry or 0
         last_result: StepResult | None = None
@@ -110,6 +158,12 @@ class ExecutionEngine:
             options = self._build_run_options(step, attempt)
 
             result = await self.provider.run(prompt, options)
+            self.events.step_result(
+                step.id, execution=execution,
+                provider_status="error" if result.is_error else "ok",
+                turns=result.num_turns, duration_ms=result.duration_ms,
+                cost_usd=result.cost_usd,
+            )
 
             # Write output file if specified
             if step.output and result.output_text:
@@ -118,38 +172,83 @@ class ExecutionEngine:
             # Run check if defined
             status = "success"
             if step.check and not result.is_error:
-                check_output = await self.provider.check(
-                    result.session_id, step.check.prompt
-                )
+                if step.check.prompt:
+                    check_output = await self.provider.check(
+                        result.session_id, step.check.prompt
+                    )
+                else:
+                    check_output = result.output_text
                 result.check_output = check_output
                 status = await self._evaluate_check(step, check_output)
 
             if result.is_error:
                 status = "failure"
 
-            if status == "success":
+            if status in ("success", "routed"):
                 self.results[step.id] = result
                 if self.store:
-                    self.store.save_step_result(step.id, result, "success", attempt)
-                await self._handle_routes(step, "success")
-                print(f"[hydra] done: {step.id} (success)", file=sys.stderr)
+                    self.store.save_step_result(
+                        step.id, result, "success", attempt, execution
+                    )
+                # "routed" means check.routes already dispatched the goto.
+                if status == "success":
+                    await self._handle_routes(step, "success")
                 return
 
             # Failed — retry or give up
             last_result = result
             if attempt < max_retries:
-                print(
-                    f"[hydra] retry {attempt + 1}/{max_retries}: {step.id}",
-                    file=sys.stderr,
-                )
+                self.events.retry(step.id, attempt=attempt + 1, max_retries=max_retries)
                 continue
 
         # All retries exhausted
         self.results[step.id] = last_result  # type: ignore[assignment]
         if self.store and last_result:
-            self.store.save_step_result(step.id, last_result, "failure", max_retries)
-        print(f"[hydra] done: {step.id} (failure)", file=sys.stderr)
+            self.store.save_step_result(
+                step.id, last_result, "failure", max_retries, execution
+            )
         await self._handle_routes(step, "failure")
+
+    async def _maybe_compact(self, step: StepDef) -> None:
+        """Compact the resume target in place when it exceeds the step's threshold.
+
+        Gate is free: we read the target's context percentage from usage already
+        captured on its StepResult — no extra API call. Only when it's over
+        compact_before_resume do we pay for an actual /compact.
+
+        Parallel-safe: several steps may resume the same session concurrently
+        (e.g. three reviewers resuming `analyze`). A per-target lock ensures the
+        first compacts once and rewrites the cached size; the others re-read the
+        now-small size inside the lock and skip.
+        """
+        threshold = step.compact_before_resume
+        if not threshold or not step.resume:
+            return
+        target = self.results.get(step.resume)
+        if target is None:
+            return
+
+        lock = self._compact_locks.setdefault(step.resume, asyncio.Lock())
+        async with lock:
+            target = self.results[step.resume]  # re-read under lock
+            pct = target.context_pct()
+            if pct is None or pct < threshold:
+                return
+
+            before_tokens = target.input_tokens
+            after_tokens, window = await self.provider.compact(target.session_id)
+            # Rewrite the cached size so sibling steps (and later resumes) see the
+            # compacted transcript and don't compact again.
+            if after_tokens:
+                target.input_tokens = after_tokens
+            if window:
+                target.context_window = window
+            after_pct = target.context_pct()
+            self.events.compact(
+                step.id, target=step.resume, before_pct=pct, threshold=threshold,
+                before_tokens=before_tokens, after_tokens=target.input_tokens,
+                after_pct=after_pct,
+            )
 
     def _build_step_prompt(
         self, step: StepDef, last_result: StepResult | None, attempt: int
@@ -178,6 +277,7 @@ class ExecutionEngine:
             inject_paths=step.inject,
             workdir=self.workdir,
             retry_feedback=retry_feedback,
+            output_path=step.output,
         )
 
     def _build_run_options(self, step: StepDef, attempt: int) -> StepRunOptions:
@@ -206,15 +306,33 @@ class ExecutionEngine:
             return "success"
 
         if check.success_pattern:
-            if re.search(check.success_pattern, check_output, re.IGNORECASE):
-                return "success"
-            return "failure"
+            # Match against the final verdict line, not the whole document. A
+            # verdict agent often narrates or self-corrects before concluding
+            # (e.g. writes "ACCEPT" then appends a "REJECT" correction below),
+            # so a whole-document search would match superseded draft text. The
+            # last non-empty line is the actual conclusion.
+            last_line = _last_nonempty_line(check_output)
+            matched = bool(re.search(check.success_pattern, last_line, re.IGNORECASE))
+            verdict = "success" if matched else "failure"
+            self.events.check(
+                step.id, mode="success_pattern",
+                pattern=check.success_pattern, matched=matched, verdict=verdict,
+            )
+            return verdict
 
         if check.routes:
             for cr in check.routes:
                 if re.search(cr.match, check_output, re.IGNORECASE):
+                    self.events.check(
+                        step.id, mode="routes", pattern=cr.match,
+                        matched=True, verdict="routed", target=cr.goto,
+                    )
                     await self._goto(step, cr.goto)
                     return "routed"
+            self.events.check(
+                step.id, mode="routes", pattern=None,
+                matched=False, verdict="failure",
+            )
 
         return "failure"
 
@@ -222,26 +340,37 @@ class ExecutionEngine:
         """Process step-level routes based on status."""
         if not step.routes:
             if status == "failure":
-                raise ExecutionError(f"Step '{step.id}' failed with no failure route")
+                raise ExecutionError(
+                    f"Step '{step.id}' failed and has no failure route"
+                )
             return
 
         for route in step.routes:
             if route.condition == status:
-                await self._goto(step, route.goto)
+                await self._goto(step, route.goto, condition=status)
                 return
 
         # No matching route — if failure, raise
         if status == "failure":
-            raise ExecutionError(f"Step '{step.id}' failed with no matching route")
+            raise ExecutionError(
+                f"Step '{step.id}' failed and no route matches condition 'failure'"
+            )
 
-    async def _goto(self, origin_step: StepDef, target: str | list[str]) -> None:
+    async def _goto(
+        self, origin_step: StepDef, target: str | list[str],
+        condition: str = "check",
+    ) -> None:
         """Handle goto: execute target steps (may be back-jump)."""
         if target == "$end":
+            self.events.route(
+                origin_step.id, condition=condition, target="$end", kind="end",
+            )
             return
         if target == "$fail":
-            raise ExecutionError(
-                f"Step '{origin_step.id}' routed to $fail"
+            self.events.route(
+                origin_step.id, condition=condition, target="$fail", kind="fail",
             )
+            raise ExecutionError(f"Step '{origin_step.id}' routed to $fail")
 
         targets = target if isinstance(target, list) else [target]
 
@@ -252,32 +381,45 @@ class ExecutionEngine:
             count = self.iteration_counts.get(origin_step.id, 0) + 1
             self.iteration_counts[origin_step.id] = count
             max_iter = origin_step.max_iterations or 10
+
+            subgraph = self._find_subgraph(targets, origin_step.id)
+            self.events.back_jump(
+                origin_step.id, targets=targets, subgraph=subgraph,
+                iteration=count, max_iterations=max_iter,
+            )
+
             if count >= max_iter:
                 raise ExecutionError(
-                    f"Step '{origin_step.id}' exceeded max_iterations ({max_iter})"
+                    f"Step '{origin_step.id}' exceeded max_iterations "
+                    f"({max_iter}) — loop did not converge"
                 )
 
             # Re-execute the subgraph from targets to origin
-            await self._execute_back_jump(origin_step, targets)
+            await self._execute_back_jump(origin_step, targets, subgraph)
         else:
+            self.events.route(
+                origin_step.id, condition=condition, target=targets, kind="forward",
+            )
             # Forward goto — execute targets that haven't run yet
             await self._execute_forward_goto(targets)
 
     async def _execute_back_jump(
-        self, origin: StepDef, targets: list[str]
+        self, origin: StepDef, targets: list[str], subgraph: list[str]
     ) -> None:
-        """Re-execute subgraph from targets through origin."""
-        # Find all steps between targets and origin (inclusive of targets, exclusive of origin)
-        subgraph = self._find_subgraph(targets, origin.id)
+        """Re-execute subgraph from targets through origin.
 
-        # Clear results for subgraph steps
+        The subgraph includes all DAG steps between targets and origin
+        (exclusive of origin). After re-execution, if the subgraph's last step
+        routed elsewhere (e.g. forward to origin or a different target), origin
+        may already have been re-executed. Otherwise, re-execute origin.
+        """
+        # Clear results for subgraph steps AND origin
         for sid in subgraph:
             self.results.pop(sid, None)
+        self.results.pop(origin.id, None)
 
-        # Re-execute in topological order
+        # Re-execute subgraph in topological order
         dag = build_dag(self.pipeline)
-        # Filter dag to subgraph only
-        sub_steps = [s for s in self.pipeline.steps if s.id in subgraph]
         resolved = {sid for sid in self.results}
         pending = list(subgraph)
 
@@ -292,8 +434,13 @@ class ExecutionEngine:
             resolved.update(ready)
             pending = [sid for sid in pending if sid not in resolved]
 
-        # Re-execute origin itself
-        await self._execute_step(origin.id)
+        # Re-execute origin only when it is a normal DAG step that naturally
+        # follows the subgraph (e.g. a step whose own check/routes drive the
+        # loop). When origin is trigger:route, it was reached via an explicit
+        # goto and the subgraph's last step (which carries the check/routes)
+        # already decided the next action — re-running origin would loop forever.
+        if origin.trigger != "route" and origin.id not in self.results:
+            await self._execute_step(origin.id)
 
     async def _execute_forward_goto(self, targets: list[str]) -> None:
         """Execute forward-goto targets (trigger:route steps)."""
@@ -302,11 +449,13 @@ class ExecutionEngine:
                 await self._execute_step(target)
 
     def _find_subgraph(self, targets: list[str], origin_id: str) -> list[str]:
-        """Find all DAG steps between targets and origin (topological order)."""
+        """Find all DAG steps between targets and origin (topological order).
+
+        Excludes trigger:route steps — they are only reached via explicit goto,
+        not as part of subgraph re-execution.
+        """
         dag = build_dag(self.pipeline)
-        # BFS forward from targets, stop at origin
-        visited: set[str] = set()
-        queue = list(targets)
+        route_steps = {s.id for s in self.pipeline.steps if s.trigger == "route"}
 
         # Build reverse DAG (step → its dependents)
         reverse: dict[str, list[str]] = {s.id: [] for s in self.pipeline.steps}
@@ -315,6 +464,8 @@ class ExecutionEngine:
                 reverse.setdefault(dep, []).append(sid)
 
         # Forward walk from targets through dependents, stop at origin
+        visited: set[str] = set()
+        queue = list(targets)
         while queue:
             current = queue.pop(0)
             if current in visited:
@@ -323,8 +474,11 @@ class ExecutionEngine:
                 continue
             visited.add(current)
             for dependent in reverse.get(current, []):
-                if dependent != origin_id and dependent not in visited:
-                    queue.append(dependent)
+                if dependent == origin_id or dependent in visited:
+                    continue
+                if dependent in route_steps:
+                    continue
+                queue.append(dependent)
 
         # Return in pipeline order
         order = {s.id: i for i, s in enumerate(self.pipeline.steps)}

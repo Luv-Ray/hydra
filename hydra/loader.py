@@ -49,13 +49,18 @@ def load_pipeline(
         step = _expand_step_templates(step, resolved_inputs)
         steps.append(step)
 
+    # Expand workdir template
+    workdir = data.get("workdir")
+    if workdir:
+        workdir = expand_template(workdir, resolved_inputs)
+
     return Pipeline(
         name=data.get("name", path.stem),
         version=data.get("version", 1),
         steps=steps,
         inputs=input_defs,
         defaults=defaults,
-        workdir=data.get("workdir"),
+        workdir=workdir,
         mcp_servers=data.get("mcp_servers", {}),
     )
 

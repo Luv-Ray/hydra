@@ -11,6 +11,7 @@ def build_prompt(
     inject_paths: list[str],
     workdir: str | None = None,
     retry_feedback: str | None = None,
+    output_path: str | None = None,
 ) -> str:
     """Assemble the full prompt: retry feedback + inject content + step prompt.
 
@@ -19,6 +20,9 @@ def build_prompt(
         inject_paths: File paths and glob patterns to inject.
         workdir: Working directory for resolving relative paths.
         retry_feedback: Optional feedback from previous attempt to prepend.
+        output_path: If set, the step captures the reply body into this file.
+            A contract note is appended so the model understands its reply IS
+            the artifact, not a chat message about the work.
     """
     parts: list[str] = []
 
@@ -43,8 +47,34 @@ def build_prompt(
 
     if parts:
         prefix = "\n\n---\n\n".join(parts)
-        return f"{prefix}\n\n---\n\n{prompt}"
-    return prompt
+        full = f"{prefix}\n\n---\n\n{prompt}"
+    else:
+        full = prompt
+
+    if output_path:
+        full = f"{full}\n\n---\n\n{_output_contract(output_path)}"
+
+    return full
+
+
+def _output_contract(output_path: str) -> str:
+    """Note appended when a step captures its reply body into a file.
+
+    Root cause this addresses: by default a model frames its reply as a message
+    to a human — adding preambles, progress recaps, and sign-offs. But here the
+    reply is saved verbatim as a file and read by later steps; no human reads it
+    as a message. This states the document-production frame once, at the
+    framework level, so the model emits the artifact itself rather than prose
+    about producing it. Kept general on purpose — not a list of things to avoid.
+    """
+    return (
+        f"[Output contract] Your reply to this message is saved verbatim as the "
+        f"file `{output_path}` and read by later steps in this pipeline as input. "
+        "It is the file's content, not a message to a reader. Output exactly what "
+        "that file should contain and nothing else — no preamble, framing, or "
+        "commentary around it."
+    )
+
 
 
 def read_inject_files(
@@ -78,6 +108,22 @@ def read_inject_files(
             results.append((_display_path(resolved, workdir), content))
 
     return results
+
+
+def count_inject(inject_paths: list[str], workdir: str | None = None) -> int:
+    """Count how many files would actually be injected (globs expanded).
+
+    Used for observability — reports how much context a step pulls in without
+    reading the file bodies.
+    """
+    total = 0
+    for pattern in inject_paths:
+        resolved = _resolve_path(pattern, workdir)
+        if "*" in pattern or "?" in pattern:
+            total += len(globmod.glob(resolved, recursive=True))
+        elif Path(resolved).exists():
+            total += 1
+    return total
 
 
 def _resolve_path(path: str, workdir: str | None) -> str:

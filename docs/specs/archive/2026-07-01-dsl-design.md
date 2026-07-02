@@ -1,5 +1,9 @@
 # Hydra DSL v1 设计规范
 
+> **⚠️ 已归档(2026-07-01 早期设计快照,不再维护)。**
+> 本文档记录的是 DSL 的初始设计意图,与当前实现存在偏差(例如 `hydra resume` 命令、`--concurrency` 断点续跑、`defaults.provider`、`session.jsonl` / `check.py` 等在实现中并不存在或已改变)。
+> **权威且持续维护的 DSL 参考请见 [`../dsl-reference.md`](../dsl-reference.md)。** 本文件仅作设计存档保留。
+
 ## 概述
 
 Hydra 是一个轻量 AI agent 编排引擎，用 YAML DSL 定义多步骤 pipeline，以 Claude Agent SDK 为执行后端。DSL 设计目标：
