@@ -34,7 +34,7 @@ class VerdictProvider:
             text = f"output-{sid}"
         return StepResult(session_id=f"sess-{sid}", output_text=text)
 
-    async def check(self, session_id: str, prompt: str) -> str:
+    async def check(self, session_id: str, prompt: str, cwd: str | None = None) -> str:
         return ""
 
 

@@ -21,7 +21,7 @@ class SizedProvider:
     def __init__(self, analyze_pct: float, window: int = 1_000_000):
         self.window = window
         self.analyze_tokens = int(window * analyze_pct / 100)
-        self.compact_calls: list[str] = []
+        self.compact_calls: list[tuple[str, str | None]] = []
         self.run_calls: list[str] = []
 
     async def run(self, prompt: str, options: StepRunOptions) -> StepResult:
@@ -35,11 +35,13 @@ class SizedProvider:
             context_window=self.window,
         )
 
-    async def check(self, session_id: str, prompt: str) -> str:
+    async def check(self, session_id: str, prompt: str, cwd: str | None = None) -> str:
         return ""
 
-    async def compact(self, session_id: str) -> tuple[int, int]:
-        self.compact_calls.append(session_id)
+    async def compact(
+        self, session_id: str, model: str | None = None, cwd: str | None = None
+    ) -> tuple[int, int]:
+        self.compact_calls.append((session_id, model, cwd))
         # Simulate /compact shrinking the transcript to a small size.
         return 5000, self.window
 
@@ -54,6 +56,7 @@ defaults:
 steps:
   - id: analyze
     prompt: "analyze"
+    model: claude-opus-4-8[1m]
     output: root-cause.md
 
   - id: review_a
@@ -70,26 +73,33 @@ steps:
 """
 
 
-def _run(tmp_path: Path, analyze_pct: float) -> SizedProvider:
+def _run(tmp_path: Path, analyze_pct: float) -> tuple[SizedProvider, str]:
     p = tmp_path / "pipeline.yaml"
     p.write_text(PIPELINE)
     pipeline = load_pipeline(p)
-    pipeline.workdir = str(tmp_path)
+    workdir = str(tmp_path)
+    pipeline.workdir = workdir
     provider = SizedProvider(analyze_pct=analyze_pct)
     engine = ExecutionEngine(pipeline=pipeline, inputs={}, provider=provider)
     result = asyncio.run(engine.run())
     assert result == "success"
-    return provider
+    return provider, workdir
 
 
 def test_compacts_once_when_over_threshold(tmp_path: Path):
     # analyze at 70% > 50% threshold: two parallel reviewers resume it, but the
     # per-target lock means /compact runs exactly once.
-    provider = _run(tmp_path, analyze_pct=70)
-    assert provider.compact_calls == ["sess-analyze"], provider.compact_calls
+    provider, workdir = _run(tmp_path, analyze_pct=70)
+    # Compacts exactly once, on analyze's own model, in the pipeline workdir.
+    # Model must match the resumed session (cross-model /compact is a cache
+    # miss); cwd must match too — the CLI keys sessions by project dir, so a
+    # wrong cwd fails with "No conversation found".
+    assert provider.compact_calls == [
+        ("sess-analyze", "claude-opus-4-8[1m]", workdir)
+    ], provider.compact_calls
 
 
 def test_skips_when_under_threshold(tmp_path: Path):
     # analyze at 30% < 50%: never compact.
-    provider = _run(tmp_path, analyze_pct=30)
+    provider, _ = _run(tmp_path, analyze_pct=30)
     assert provider.compact_calls == [], provider.compact_calls

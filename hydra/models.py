@@ -25,7 +25,7 @@ class InputDef:
 class DefaultsDef:
     model: str | None = None
     retry: int = 0
-    timeout: int = 300
+    timeout: int | None = None  # None = no wall-clock limit; set to opt in
     max_iterations: int = 10
     allowed_tools: list[str] | None = None
 
@@ -34,7 +34,7 @@ class DefaultsDef:
         return cls(
             model=d.get("model"),
             retry=d.get("retry", 0),
-            timeout=d.get("timeout", 300),
+            timeout=d.get("timeout"),
             max_iterations=d.get("max_iterations", 10),
             allowed_tools=d.get("allowed_tools"),
         )

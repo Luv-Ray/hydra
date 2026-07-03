@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,10 @@ class ExecutionEngine:
         self.verbose = verbose
 
         self.step_map = {s.id: s for s in pipeline.steps}
+        # Dependency graph is a pure function of the (immutable) pipeline, so
+        # build it once here rather than recomputing on every run/back-jump/
+        # subgraph query.
+        self.dag = build_dag(pipeline)
         self.results: dict[str, StepResult] = {}
         self.skipped: set[str] = set()
         self.iteration_counts: dict[str, int] = {}
@@ -83,9 +88,13 @@ class ExecutionEngine:
         if isinstance(self.provider, ClaudeProvider):
             self.provider.set_trace_file(self.store.run_dir / "agent-trace.log")
 
+        # Record when-skipped steps so the run dir reflects the full plan, not
+        # just the steps that ran (skipped steps otherwise leave no trace).
+        for sid in self.skipped:
+            self.store.save_step_skipped(sid)
+
         # Build DAG and execute
-        dag = build_dag(self.pipeline)
-        layers = topological_layers(self.pipeline, dag)
+        layers = topological_layers(self.pipeline, self.dag)
 
         try:
             for layer in layers:
@@ -174,7 +183,7 @@ class ExecutionEngine:
             if step.check and not result.is_error:
                 if step.check.prompt:
                     check_output = await self.provider.check(
-                        result.session_id, step.check.prompt
+                        result.session_id, step.check.prompt, self.workdir
                     )
                 else:
                     check_output = result.output_text
@@ -236,7 +245,14 @@ class ExecutionEngine:
                 return
 
             before_tokens = target.input_tokens
-            after_tokens, window = await self.provider.compact(target.session_id)
+            # Compact on the same model the target session was built on: /compact
+            # replays the transcript through the model, so a mismatch is a full
+            # cache miss. step_map carries the defaults-merged model.
+            target_step = self.step_map.get(step.resume)
+            target_model = target_step.model if target_step else None
+            after_tokens, window = await self.provider.compact(
+                target.session_id, target_model, self.workdir
+            )
             # Rewrite the cached size so sibling steps (and later resumes) see the
             # compacted transcript and don't compact again.
             if after_tokens:
@@ -269,7 +285,10 @@ class ExecutionEngine:
                     f"[Retry with the above feedback]"
                 )
 
-        # Determine if missing inject files are allowed (goto back-jump scenario)
+        # In a back-jump loop, an upstream artifact may legitimately not exist
+        # yet on the first pass, so missing precise inject files are tolerated.
+        # On a normal forward run a missing file is a config error (see
+        # build_prompt) — surfacing it beats silently dropping a typo'd path.
         allow_missing = step.id in self.iteration_counts
 
         return build_prompt(
@@ -278,6 +297,7 @@ class ExecutionEngine:
             workdir=self.workdir,
             retry_feedback=retry_feedback,
             output_path=step.output,
+            allow_missing=allow_missing,
         )
 
     def _build_run_options(self, step: StepDef, attempt: int) -> StepRunOptions:
@@ -299,8 +319,6 @@ class ExecutionEngine:
 
     async def _evaluate_check(self, step: StepDef, check_output: str) -> str:
         """Evaluate check result. Returns 'success', 'failure', or 'routed'."""
-        import re
-
         check = step.check
         if not check:
             return "success"
@@ -389,6 +407,18 @@ class ExecutionEngine:
             )
 
             if count >= max_iter:
+                # Loop did not converge. If the origin declares an escape route
+                # (`if: max_iterations`), take it instead of failing — this lets
+                # a pipeline accept the last unconverged result and move on
+                # (e.g. goto final_report) rather than aborting the whole run.
+                escape = self._max_iter_route(origin_step)
+                if escape is not None:
+                    self.events.route(
+                        origin_step.id, condition="max_iterations",
+                        target=escape, kind="escape",
+                    )
+                    await self._goto_forward_only(origin_step, escape)
+                    return
                 raise ExecutionError(
                     f"Step '{origin_step.id}' exceeded max_iterations "
                     f"({max_iter}) — loop did not converge"
@@ -402,6 +432,52 @@ class ExecutionEngine:
             )
             # Forward goto — execute targets that haven't run yet
             await self._execute_forward_goto(targets)
+
+    def _max_iter_route(self, step: StepDef) -> str | list[str] | None:
+        """The step's `if: max_iterations` escape goto, if it declares one.
+
+        Checked only when a loop exhausts max_iterations (see _goto). Absent →
+        exhaustion stays a hard failure (backward compatible).
+        """
+        for route in step.routes or []:
+            if route.condition == "max_iterations":
+                return route.goto
+        return None
+
+    async def _goto_forward_only(
+        self, origin_step: StepDef, target: str | list[str]
+    ) -> None:
+        """Dispatch an escape goto that must not loop back.
+
+        Reached only from the max_iterations escape. The loop already failed to
+        converge, so the target must move the pipeline forward or terminate —
+        never re-enter a step whose results still exist (that would just trigger
+        another back-jump and re-arm the exhausted loop). $end/$fail terminate;
+        any other target must be unexecuted (a forward step). A back-jump target
+        here is a pipeline authoring error, surfaced rather than silently looped.
+        """
+        if target == "$end":
+            self.events.route(
+                origin_step.id, condition="max_iterations", target="$end", kind="end",
+            )
+            return
+        if target == "$fail":
+            self.events.route(
+                origin_step.id, condition="max_iterations", target="$fail", kind="fail",
+            )
+            raise ExecutionError(
+                f"Step '{origin_step.id}' routed to $fail after max_iterations"
+            )
+
+        targets = target if isinstance(target, list) else [target]
+        looping = [t for t in targets if t in self.results]
+        if looping:
+            raise ExecutionError(
+                f"Step '{origin_step.id}': max_iterations escape goto {looping} "
+                f"points back into the loop — it must go forward ($end, $fail, "
+                f"or an unexecuted step)"
+            )
+        await self._execute_forward_goto(targets)
 
     async def _execute_back_jump(
         self, origin: StepDef, targets: list[str], subgraph: list[str]
@@ -419,7 +495,7 @@ class ExecutionEngine:
         self.results.pop(origin.id, None)
 
         # Re-execute subgraph in topological order
-        dag = build_dag(self.pipeline)
+        dag = self.dag
         resolved = {sid for sid in self.results}
         pending = list(subgraph)
 
@@ -454,7 +530,7 @@ class ExecutionEngine:
         Excludes trigger:route steps — they are only reached via explicit goto,
         not as part of subgraph re-execution.
         """
-        dag = build_dag(self.pipeline)
+        dag = self.dag
         route_steps = {s.id for s in self.pipeline.steps if s.trigger == "route"}
 
         # Build reverse DAG (step → its dependents)
@@ -500,8 +576,7 @@ class ExecutionEngine:
 
     def _print_dry_run(self) -> None:
         """Print DAG and execution plan without running anything."""
-        dag = build_dag(self.pipeline)
-        layers = topological_layers(self.pipeline, dag)
+        layers = topological_layers(self.pipeline, self.dag)
 
         print(f"Pipeline: {self.pipeline.name}")
         print(f"Workdir: {self.workdir or '.'}")
@@ -515,6 +590,6 @@ class ExecutionEngine:
         print("Route-only steps:", [s.id for s in self.pipeline.steps if s.trigger == "route"])
         print()
         print("Dependencies:")
-        for sid, deps in dag.items():
+        for sid, deps in self.dag.items():
             if deps:
                 print(f"  {sid} ← {deps}")

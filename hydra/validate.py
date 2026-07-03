@@ -5,7 +5,7 @@ from __future__ import annotations
 import glob as globmod
 import sys
 
-from .errors import ValidationError
+from .errors import TemplateError, ValidationError
 from .expr import eval_when
 from .models import Pipeline, StepDef
 
@@ -55,15 +55,25 @@ def _check_references(steps: list[StepDef], step_ids: set[str]) -> None:
 
 
 def _check_resume_uniqueness(steps: list[StepDef]) -> None:
-    resume_targets: dict[str, list[str]] = {}
+    """A session may be resumed by many route steps but at most one DAG step.
+
+    resume appends to the target's on-disk session (it does not fork a copy), so
+    two resumers that run concurrently would corrupt each other's transcript.
+    DAG steps in the same topological layer run in parallel, hence the 1-max on
+    non-route resumers. trigger:route steps are reached only via explicit goto,
+    one at a time, so any number of them may resume the same target serially
+    (e.g. mini-revise and revise both resuming analyze on different reject paths).
+    """
+    dag_resumers: dict[str, list[str]] = {}
     for step in steps:
-        if step.resume:
-            resume_targets.setdefault(step.resume, []).append(step.id)
-    for target, users in resume_targets.items():
+        if step.resume and step.trigger != "route":
+            dag_resumers.setdefault(step.resume, []).append(step.id)
+    for target, users in dag_resumers.items():
         if len(users) > 1:
             raise ValidationError(
-                f"Multiple steps resume '{target}': {users}. "
-                f"resume is 1:1 — only one downstream can resume a step."
+                f"Multiple non-route steps resume '{target}': {users}. "
+                f"Concurrent resumers would corrupt the shared session — at most "
+                f"one DAG step may resume a target (route steps are unlimited)."
             )
 
 
@@ -140,12 +150,21 @@ def _check_loop_protection(
 
 
 def _check_when_syntax(steps: list[StepDef]) -> None:
+    """Reject malformed when-expressions at validate time.
+
+    eval_when resolves unknown inputs to "" (never raises for a missing var),
+    so evaluating against empty inputs exercises only the parse/allowed-node
+    path. A TemplateError here is therefore a genuine syntax or unsupported-
+    construct error, which should fail validation rather than be swallowed.
+    """
     for step in steps:
         if step.when:
             try:
                 eval_when(step.when, {})
-            except Exception:
-                pass  # Template errors from missing inputs are fine at validate time
+            except TemplateError as e:
+                raise ValidationError(
+                    f"Step '{step.id}': invalid when expression: {e}"
+                ) from e
 
 
 def _check_check_fields(steps: list[StepDef]) -> None:

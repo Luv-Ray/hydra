@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, TextIO
@@ -77,9 +78,11 @@ SYSTEM_PROMPT = (
 class Provider(Protocol):
     async def run(self, prompt: str, options: StepRunOptions) -> StepResult: ...
 
-    async def check(self, session_id: str, prompt: str) -> str: ...
+    async def check(self, session_id: str, prompt: str, cwd: str | None = None) -> str: ...
 
-    async def compact(self, session_id: str) -> tuple[int, int]: ...
+    async def compact(
+        self, session_id: str, model: str | None = None, cwd: str | None = None
+    ) -> tuple[int, int]: ...
 
 
 class ClaudeProvider:
@@ -129,20 +132,40 @@ class ClaudeProvider:
         input_tokens = 0
         context_window = 0
 
-        async for msg in query(prompt=prompt, options=sdk_options):
-            if isinstance(msg, AssistantMessage):
-                self._log_assistant(msg, options.step_id)
-            elif isinstance(msg, ResultMessage):
-                session_id = msg.session_id
-                is_error = msg.is_error
-                cost_usd = msg.total_cost_usd
-                duration_ms = msg.duration_ms
-                num_turns = msg.num_turns
-                input_tokens, context_window = _extract_context(msg)
-                if msg.result:
-                    result_text = msg.result
-                if msg.permission_denials or msg.errors:
-                    self._log_result(msg, options.step_id)
+        async def _consume() -> None:
+            nonlocal session_id, result_text, is_error, cost_usd
+            nonlocal duration_ms, num_turns, input_tokens, context_window
+            async for msg in query(prompt=prompt, options=sdk_options):
+                if isinstance(msg, AssistantMessage):
+                    self._log_assistant(msg, options.step_id)
+                elif isinstance(msg, ResultMessage):
+                    session_id = msg.session_id
+                    is_error = msg.is_error
+                    cost_usd = msg.total_cost_usd
+                    duration_ms = msg.duration_ms
+                    num_turns = msg.num_turns
+                    input_tokens, context_window = _extract_context(msg)
+                    if msg.result:
+                        result_text = msg.result
+                    if msg.permission_denials or msg.errors:
+                        self._log_result(msg, options.step_id)
+
+        # The SDK exposes no per-turn timeout, so enforce the step's wall-clock
+        # budget here. On expiry we surface it as a failed StepResult (not a
+        # raise) so retry/route handling treats it like any other step failure.
+        try:
+            if options.timeout:
+                await asyncio.wait_for(_consume(), timeout=options.timeout)
+            else:
+                await _consume()
+        except asyncio.TimeoutError:
+            self._log(f"step '{options.step_id}' timed out after {options.timeout}s")
+            return StepResult(
+                session_id=session_id or f"timeout-{options.step_id}",
+                output_text=result_text or "",
+                is_error=True,
+                duration_ms=(options.timeout or 0) * 1000,
+            )
 
         if session_id is None:
             raise RuntimeError(f"Step '{options.step_id}' did not return a session ID")
@@ -158,14 +181,21 @@ class ClaudeProvider:
             context_window=context_window,
         )
 
-    async def check(self, session_id: str, prompt: str) -> str:
-        """Send a follow-up check prompt in the same session."""
+    async def check(self, session_id: str, prompt: str, cwd: str | None = None) -> str:
+        """Send a follow-up check prompt in the same session.
+
+        cwd must match the working directory the session was created under —
+        the CLI stores/looks up sessions per project dir, so resuming from a
+        different cwd fails with "No conversation found".
+        """
         self._log(f"  check: {prompt[:100]}")
         sdk_options = ClaudeAgentOptions(
             resume=session_id,
             permission_mode="bypassPermissions",
             max_turns=1,
         )
+        if cwd:
+            sdk_options.cwd = cwd
 
         result_text = ""
         async for msg in query(prompt=prompt, options=sdk_options):
@@ -176,13 +206,26 @@ class ClaudeProvider:
 
         return result_text
 
-    async def compact(self, session_id: str) -> tuple[int, int]:
+    async def compact(
+        self, session_id: str, model: str | None = None, cwd: str | None = None
+    ) -> tuple[int, int]:
         """Compact a session in place, the way `/compact` does in the CLI.
 
         Resumes the session in a throwaway connection, sends the `/compact`
         slash command (the CLI summarizes the conversation so far), and
         disconnects. The compaction persists to the session on disk, so the
         next step that resumes this id inherits the lighter transcript.
+
+        `model` must match the model the resumed session was built on. `/compact`
+        feeds the whole transcript back to the model to summarize it; running it
+        on a different model than the one that holds the cached context is a full
+        cache miss (and re-reads the entire transcript). Callers pass the resume
+        target's model so compaction stays on the same model as the step it
+        precedes.
+
+        `cwd` must match the working directory the session was created under.
+        The CLI stores sessions per project directory (keyed by cwd), so
+        resuming from a different cwd fails with "No conversation found".
 
         Returns (input_tokens, context_window) after compaction — measured via
         get_context_usage() so the caller can update its cached size and log
@@ -193,6 +236,10 @@ class ClaudeProvider:
             permission_mode="bypassPermissions",
             max_turns=1,
         )
+        if model:
+            options.model = model
+        if cwd:
+            options.cwd = cwd
         client = ClaudeSDKClient(options=options)
         await client.connect()
         try:

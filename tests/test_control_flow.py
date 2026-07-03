@@ -33,7 +33,7 @@ class FailThenSucceedProvider:
             output_text=f"Output attempt {attempt + 1}",
         )
 
-    async def check(self, session_id: str, prompt: str) -> str:
+    async def check(self, session_id: str, prompt: str, cwd: str | None = None) -> str:
         # Extract step_id from session_id
         parts = session_id.split("-")
         step_id = parts[1] if len(parts) > 1 else ""
@@ -143,3 +143,123 @@ def test_backjump_loop(backjump_pipeline_yaml: Path, tmp_path: Path):
     step_ids = [c[0] for c in provider.calls]
     assert step_ids.count("review") >= 2
     assert step_ids.count("revise") >= 2
+
+
+class NeverConvergeProvider:
+    """check always fails, so any convergence loop exhausts max_iterations."""
+
+    def __init__(self):
+        self.calls: list[tuple[str, str]] = []
+        self._n = 0
+
+    async def run(self, prompt: str, options: StepRunOptions) -> StepResult:
+        self._n += 1
+        self.calls.append((options.step_id, prompt[:200]))
+        return StepResult(
+            session_id=f"session-{options.step_id}-{self._n}",
+            output_text=f"out-{options.step_id}",
+        )
+
+    async def check(self, session_id: str, prompt: str, cwd: str | None = None) -> str:
+        return "no"
+
+
+def _escape_pipeline(tmp_path: Path, revise_routes: str) -> Path:
+    content = f"""\
+name: test-escape
+version: 1
+
+steps:
+  - id: draft
+    prompt: "Write draft"
+    output: out/draft.md
+
+  - id: revise
+    after: [draft]
+    inject: [out/draft.md]
+    prompt: "Revise"
+    output: out/draft.md
+    max_iterations: 2
+    check:
+      prompt: "Approved? yes/no"
+      success_pattern: "yes"
+    routes:
+{revise_routes}
+
+  - id: publish
+    trigger: route
+    prompt: "Publish the (possibly unconverged) draft"
+    output: out/final.md
+"""
+    p = tmp_path / "pipeline.yaml"
+    p.write_text(content)
+    return p
+
+
+def test_max_iterations_escape_route_taken(tmp_path: Path):
+    # Loop never converges; the escape route forwards to `publish` instead of
+    # failing the run.
+    routes = (
+        "      - if: success\n        goto: $end\n"
+        "      - if: failure\n        goto: revise\n"
+        "      - if: max_iterations\n        goto: publish\n"
+    )
+    pipeline = load_pipeline(_escape_pipeline(tmp_path, routes))
+    pipeline.workdir = str(tmp_path)
+    provider = NeverConvergeProvider()
+    engine = ExecutionEngine(pipeline=pipeline, inputs={}, provider=provider)
+    result = asyncio.run(engine.run())
+
+    assert result == "success"
+    step_ids = [c[0] for c in provider.calls]
+    assert "publish" in step_ids  # escape landed on the forward step
+
+
+def test_max_iterations_without_escape_still_fails(tmp_path: Path):
+    # No `if: max_iterations` route → exhaustion remains a hard failure.
+    routes = (
+        "      - if: success\n        goto: $end\n"
+        "      - if: failure\n        goto: revise\n"
+    )
+    pipeline = load_pipeline(_escape_pipeline(tmp_path, routes))
+    pipeline.workdir = str(tmp_path)
+    provider = NeverConvergeProvider()
+    engine = ExecutionEngine(pipeline=pipeline, inputs={}, provider=provider)
+    result = asyncio.run(engine.run())
+
+    assert result == "failure"
+
+
+def test_max_iterations_escape_to_end(tmp_path: Path):
+    # Escape to $end stops cleanly on the current (unconverged) result.
+    routes = (
+        "      - if: success\n        goto: $end\n"
+        "      - if: failure\n        goto: revise\n"
+        "      - if: max_iterations\n        goto: $end\n"
+    )
+    pipeline = load_pipeline(_escape_pipeline(tmp_path, routes))
+    pipeline.workdir = str(tmp_path)
+    provider = NeverConvergeProvider()
+    engine = ExecutionEngine(pipeline=pipeline, inputs={}, provider=provider)
+    result = asyncio.run(engine.run())
+
+    assert result == "success"
+    step_ids = [c[0] for c in provider.calls]
+    assert "publish" not in step_ids  # $end stops before the forward step
+
+
+def test_max_iterations_escape_looping_back_is_rejected(tmp_path: Path):
+    # An escape goto that points back into the already-run loop (revise) would
+    # just re-arm the exhausted loop — surfaced as a failure, not silently looped.
+    routes = (
+        "      - if: success\n        goto: $end\n"
+        "      - if: failure\n        goto: revise\n"
+        "      - if: max_iterations\n        goto: revise\n"
+    )
+    pipeline = load_pipeline(_escape_pipeline(tmp_path, routes))
+    pipeline.workdir = str(tmp_path)
+    provider = NeverConvergeProvider()
+    engine = ExecutionEngine(pipeline=pipeline, inputs={}, provider=provider)
+    result = asyncio.run(engine.run())
+
+    assert result == "failure"

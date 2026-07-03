@@ -25,7 +25,7 @@ inputs:                        # 可选,运行时参数
 defaults:                      # 可选,step 属性默认值
   model: claude-sonnet-4-6
   retry: 0
-  timeout: 300
+  timeout: 1800        # 可选;省略则不限墙钟
   max_iterations: 10
   allowed_tools: [Read, Edit, Write, Bash, Glob, Grep]
 
@@ -80,12 +80,12 @@ step 未显式设置的字段,取 defaults 的值;显式写了就覆盖。**没�
 | `output` | str | — | 捕获**回复正文**写入文件路径(相对 workdir),父目录自动创建;声明后自动注入输出契约,见 [output 章节](#输出捕获-output) |
 | `after` | str \| list | `[]` | 显式依赖的 step id;单个字符串会自动包成列表 |
 | `inject` | str \| list | `[]` | 注入文件列表,内容拼在 prompt 前部,支持 glob |
-| `resume` | str | — | 接续指定 step 的 session(1:1) |
+| `resume` | str | — | 接续指定 step 的 session(数量约束见 [resume 章节](#会话接续-resume--压缩)) |
 | `compact_before_resume` | int | — | resume 前压缩阈值(窗口百分比),见 [resume 章节](#会话接续-resume--压缩) |
 | `model` | str | defaults | 覆盖模型 |
 | `retry` | int | defaults(0) | 自动重试次数 |
 | `retry_inject` | str | — | 重试反馈注入:`last_output` / `check_output` / 不写(盲重试) |
-| `timeout` | int | defaults(300) | 超时秒数 |
+| `timeout` | int | — | 单次执行墙钟超时(秒),**可选**;不写(且 defaults 也不写)则**不限**。写了则由 provider 用 `asyncio.wait_for` 强制,超时→该次执行按失败处理(走 retry/route) |
 | `allowed_tools` | list | defaults | 允许的工具列表 |
 | `max_turns` | int | — | agent 最大交互轮数 |
 | `max_iterations` | int | defaults(10) | goto 回跳循环最大次数 |
@@ -124,8 +124,8 @@ step 未显式设置的字段,取 defaults 的值;显式写了就覆盖。**没�
 `inject.py` 的实际行为:
 
 - 每个注入文件渲染为 `[File: <相对路径>]\n<内容>`,多个文件之间及与 prompt 之间用 `\n\n---\n\n` 分隔,整体拼在 prompt **前部**。
-- **精确文件不存在** → 静默跳过(不报错)。这支持 goto 回跳循环第一轮上游还没产出的情况。
-- **glob 模式**(含 `*` 或 `?`)→ `glob.glob(recursive=True)` 展开,匹配到 0 个文件时静默跳过。
+- **精确文件不存在** → **前向运行时报错**(`FileNotFoundError`),避免拼错的 inject 路径被悄悄吞掉。**唯一例外**:回跳循环中(该 step 已进入 `iteration_counts`)容忍缺失并静默跳过,因为第一轮上游可能还没产出该文件。
+- **glob 模式**(含 `*` 或 `?`)→ `glob.glob(recursive=True)` 展开,匹配到 0 个文件时静默跳过(glob 本就不"期待"具体文件)。
 - 相对路径相对 workdir 解析;显示路径尽量取相对 workdir 的形式。
 
 > 校验期 warning:inject 含 glob 且该 step 没有任何 `after` 依赖 → 提示"文件运行时可能不存在"(不阻塞执行)。
@@ -176,7 +176,7 @@ step 未显式设置的字段,取 defaults 的值;显式写了就覆盖。**没�
 
 ### 约束(`validate.py`)
 
-- **1:1**——同一个 step 只能被一个下游 resume。多个 step 都 resume 同一 parent → 校验报错。
+- **resume 数量约束**——`resume` 是往目标的磁盘 session **追加**、不是 fork 副本,并发 resume 会互相写坏 transcript。因此:同一 target 最多一个**非 route** step 可以 resume(DAG 同层会并发);`trigger: route` step 靠 goto 串行触发、不会重叠,数量不限(如 `mini-revise` 和 `revise` 都 resume `analyze`)。违反前者 → 校验报错。
 - resume 引用的 step 必须存在。
 
 ### compact_before_resume
@@ -198,12 +198,15 @@ routes:
     goto: verify
   - if: failure
     goto: manual_fix
+  - if: max_iterations      # 可选:回跳循环耗尽时的逃生出口
+    goto: final_report
 ```
 
 ### 条件值
 
 - `success` — step 成功完成(含 check 通过)
 - `failure` — retry 耗尽后仍失败,或 check 判定失败
+- `max_iterations` — **惰性条件**:不参与 success/failure 匹配,仅当该 step 作为回跳发起者、循环达到 `max_iterations` 上限时触发。用于"改了 N 轮仍不收敛,就带着当前结果前进"而非整体失败。目标受"只能前进"约束(见 [回跳循环](#goto-回跳循环) 第 6 条)。
 
 ### goto 目标
 
@@ -225,8 +228,12 @@ routes:
 2. 计算**子图**——从目标到发起者之间的所有 DAG step(`_find_subgraph`);`trigger: route` 的 step 被排除在子图外。
 3. 清除子图 step(及发起者)的 results,按拓扑序重跑子图。
 4. 重跑时 inject 读取的是文件**最新内容**(上一轮产出)。
-5. `max_iterations` 计数器在**发起者**上,每次回跳 +1;达到上限 → 抛错"loop did not converge"。
-6. 发起者自身仅当它是普通 DAG step 时才自动重跑;若发起者是 `trigger: route`(经显式 goto 触达),则由子图末步的 check/routes 决定去向,不自动重跑(否则死循环)。
+5. `max_iterations` 计数器在**发起者**上,每次回跳 +1;达到上限时:
+   - **发起者的** `routes` 里若有 `if: max_iterations` 分支 → 走该 goto(**逃生路由**),让 pipeline 带着最后一版未收敛结果继续,而不是整体失败。
+   - 否则 → 抛错 "loop did not converge"(默认行为,向后兼容)。
+   - ⚠️ 逃生路由必须写在**发起回跳的 step**(计数器所在者)上,不是写在审查/裁决 step 上。当"审查"与"修正"分属两个 step 时(如 `mini-review` 判定、`mini-revise` 回跳),`max_iterations` 和逃生路由都在**修正 step**(`mini-revise`)上。写错位置不报校验错,但运行时逃生静默失效、循环照旧失败。
+6. **逃生路由只能前进**:目标必须是 `$end`、`$fail`,或尚未执行的前向 step。若指向循环内已跑过的 step(会重新武装已耗尽的循环)→ 报错。常见用法:`goto: <汇总/发布 step>`(强行放行)或 `goto: $end`(停在当前结果)。
+7. 发起者自身仅当它是普通 DAG step 时才自动重跑;若发起者是 `trigger: route`(经显式 goto 触达),则由子图末步的 check/routes 决定去向,不自动重跑(否则死循环)。
 
 > 校验保护(`validate.py`):任何 step 的 route 目标是"声明在自己之前"的 step(回跳),该 step **必须**设置 `max_iterations`,否则校验报错。
 

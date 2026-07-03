@@ -12,6 +12,7 @@ def build_prompt(
     workdir: str | None = None,
     retry_feedback: str | None = None,
     output_path: str | None = None,
+    allow_missing: bool = False,
 ) -> str:
     """Assemble the full prompt: retry feedback + inject content + step prompt.
 
@@ -23,6 +24,12 @@ def build_prompt(
         output_path: If set, the step captures the reply body into this file.
             A contract note is appended so the model understands its reply IS
             the artifact, not a chat message about the work.
+        allow_missing: If True, silently skip precise inject files that don't
+            exist. Only valid in back-jump loops where an upstream artifact may
+            legitimately not exist yet on the first pass. When False (the normal
+            forward case), a missing precise file is a configuration error and
+            raises — otherwise a typo'd path is silently dropped. Globs always
+            skip non-matches regardless of this flag.
     """
     parts: list[str] = []
 
@@ -40,7 +47,11 @@ def build_prompt(
         else:
             path = Path(resolved)
             if not path.exists():
-                continue
+                if allow_missing:
+                    continue
+                raise FileNotFoundError(
+                    f"Inject file not found: {pattern} (resolved: {resolved})"
+                )
             content = path.read_text()
             display_path = _display_path(resolved, workdir)
             parts.append(f"[File: {display_path}]\n{content}")

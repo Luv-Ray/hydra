@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from hydra.inject import build_prompt
 
 
@@ -44,3 +46,36 @@ def test_contract_follows_injected_files(tmp_path: Path):
         < out.index("Summarize A")
         < out.index("Output contract")
     )
+
+
+def test_missing_precise_inject_raises_on_forward_run(tmp_path: Path):
+    # A missing precise file on a normal forward run is a config error (e.g. a
+    # typo'd path) and must surface, not be silently dropped.
+    with pytest.raises(FileNotFoundError, match="ghost.md"):
+        build_prompt(
+            prompt="use the file",
+            inject_paths=["ghost.md"],
+            workdir=str(tmp_path),
+        )
+
+
+def test_missing_precise_inject_tolerated_when_allow_missing(tmp_path: Path):
+    # In a back-jump loop an upstream artifact may not exist yet on the first
+    # pass, so allow_missing skips it silently.
+    out = build_prompt(
+        prompt="use the file",
+        inject_paths=["ghost.md"],
+        workdir=str(tmp_path),
+        allow_missing=True,
+    )
+    assert out == "use the file"
+
+
+def test_missing_glob_never_raises(tmp_path: Path):
+    # Globs skip non-matches regardless of allow_missing — no file is "expected".
+    out = build_prompt(
+        prompt="use the files",
+        inject_paths=["*.md"],
+        workdir=str(tmp_path),
+    )
+    assert out == "use the files"
