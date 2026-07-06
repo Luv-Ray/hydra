@@ -41,6 +41,15 @@ class StepResult:
     # Context accounting (from model_usage) — drives compact_before_resume.
     input_tokens: int = 0
     context_window: int = 0
+    # Termination diagnostics from the SDK ResultMessage. Recorded for every
+    # step (not just verbose runs) so an empty/abnormal output can be told apart
+    # from a genuine model reply after the fact — e.g. subtype "error_max_turns"
+    # or a non-None api_error_status (429/500/529) means the step never produced
+    # a verdict and must not be routed as a REJECT. See executor._classify_outcome.
+    subtype: str | None = None
+    stop_reason: str | None = None
+    api_error_status: int | None = None
+    errors: list[str] | None = None
 
     def context_pct(self) -> float | None:
         """Fraction of the model context window consumed on entry, 0-100.
@@ -139,10 +148,15 @@ class ClaudeProvider:
         num_turns = 0
         input_tokens = 0
         context_window = 0
+        subtype: str | None = None
+        stop_reason: str | None = None
+        api_error_status: int | None = None
+        errors: list[str] | None = None
 
         async def _consume() -> None:
             nonlocal session_id, result_text, is_error, cost_usd
             nonlocal duration_ms, num_turns, input_tokens, context_window
+            nonlocal subtype, stop_reason, api_error_status, errors
             async for msg in query(prompt=prompt, options=sdk_options):
                 if isinstance(msg, AssistantMessage):
                     self._log_assistant(msg, options.step_id)
@@ -153,10 +167,16 @@ class ClaudeProvider:
                     duration_ms = msg.duration_ms
                     num_turns = msg.num_turns
                     input_tokens, context_window = _extract_context(msg)
+                    subtype = msg.subtype
+                    stop_reason = msg.stop_reason
+                    api_error_status = getattr(msg, "api_error_status", None)
+                    errors = msg.errors
                     if msg.result:
                         result_text = msg.result
-                    if msg.permission_denials or msg.errors:
-                        self._log_result(msg, options.step_id)
+                    # Always record the result line (not just on denials/errors) so
+                    # every step leaves a trace of how it terminated — an empty
+                    # output is impossible to diagnose after the fact otherwise.
+                    self._log_result(msg, options.step_id)
 
         # The SDK exposes no per-turn timeout, so enforce the step's wall-clock
         # budget here. On expiry we surface it as a failed StepResult (not a
@@ -177,6 +197,10 @@ class ClaudeProvider:
                 output_text=result_text or "",
                 is_error=True,
                 duration_ms=(options.timeout or 0) * 1000,
+                subtype="timeout",
+                stop_reason=stop_reason,
+                api_error_status=api_error_status,
+                errors=errors,
             )
 
         if session_id is None:
@@ -191,6 +215,10 @@ class ClaudeProvider:
             num_turns=num_turns,
             input_tokens=input_tokens,
             context_window=context_window,
+            subtype=subtype,
+            stop_reason=stop_reason,
+            api_error_status=api_error_status,
+            errors=errors,
         )
 
     async def check(self, session_id: str, prompt: str, cwd: str | None = None) -> str:
@@ -308,6 +336,14 @@ class ClaudeProvider:
         parts = [f"status={status}", f"turns={msg.num_turns}", f"{msg.duration_ms}ms"]
         if msg.total_cost_usd:
             parts.append(f"${msg.total_cost_usd:.4f}")
+        # Whether the reply carried a body — an empty result on an ok status is
+        # exactly the failure mode this line exists to make visible.
+        parts.append("result=empty" if not msg.result else "result=present")
+        if msg.stop_reason:
+            parts.append(f"stop_reason={msg.stop_reason}")
+        api_status = getattr(msg, "api_error_status", None)
+        if api_status:
+            parts.append(f"api_error_status={api_status}")
         if msg.permission_denials:
             parts.append(f"permission_denials={len(msg.permission_denials)}")
         if msg.errors:

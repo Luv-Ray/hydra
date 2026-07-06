@@ -56,7 +56,11 @@ def build_prompt(
                 if allow_missing:
                     continue
                 raise FileNotFoundError(
-                    f"Inject file not found: {pattern} (resolved: {resolved})"
+                    f"Inject file not found: {pattern} (resolved: {resolved}). "
+                    f"If an upstream step declares this as its `output`, it most "
+                    f"likely produced an empty reply and wrote nothing — check "
+                    f"that step's result line / step_abnormal event in the run "
+                    f"logs rather than the inject path itself."
                 )
             content = path.read_text()
             display_path = _display_path(resolved, workdir)
@@ -119,7 +123,11 @@ def read_inject_files(
                 if allow_missing:
                     continue
                 raise FileNotFoundError(
-                    f"Inject file not found: {pattern} (resolved: {resolved})"
+                    f"Inject file not found: {pattern} (resolved: {resolved}). "
+                    f"If an upstream step declares this as its `output`, it most "
+                    f"likely produced an empty reply and wrote nothing — check "
+                    f"that step's result line / step_abnormal event in the run "
+                    f"logs rather than the inject path itself."
                 )
             content = path.read_text()
             results.append((_display_path(resolved, workdir), content))

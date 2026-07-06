@@ -29,6 +29,9 @@ class _FakeResult:
         self.usage = {}
         self.permission_denials = []
         self.errors = []
+        self.subtype = "success"
+        self.stop_reason = "end_turn"
+        self.api_error_status = None
 
 
 def _install_slow_query(monkeypatch, delay: float):

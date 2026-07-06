@@ -57,6 +57,8 @@ class EventLog:
     def step_result(
         self, step_id: str, *, execution: int, provider_status: str,
         turns: int, duration_ms: int, cost_usd: float | None,
+        subtype: str | None = None, stop_reason: str | None = None,
+        api_error_status: int | None = None, output_empty: bool = False,
     ) -> None:
         cost = f", ${cost_usd:.4f}" if cost_usd else ""
         self.emit(
@@ -65,6 +67,30 @@ class EventLog:
             f"({turns} turns, {duration_ms}ms{cost})",
             step=step_id, execution=execution, provider_status=provider_status,
             turns=turns, duration_ms=duration_ms, cost_usd=cost_usd,
+            # Termination diagnostics — always recorded so an empty/abnormal
+            # output can be diagnosed from events.jsonl without a verbose rerun.
+            subtype=subtype, stop_reason=stop_reason,
+            api_error_status=api_error_status, output_empty=output_empty,
+        )
+
+    def step_abnormal(
+        self, step_id: str, *, reason: str, will_retry: bool,
+        attempt: int, budget: int,
+    ) -> None:
+        """A step produced no trustworthy answer (empty/api-error/error-subtype).
+
+        Distinct from a model REJECT: this never routes as a check-failure. It
+        either retries within its abnormal budget or hard-fails the pipeline.
+        """
+        tail = (
+            f"retry {attempt}/{budget}" if will_retry
+            else "no retries left → abort"
+        )
+        self.emit(
+            "step_abnormal",
+            f"  {step_id}: abnormal outcome ({reason}) → {tail}",
+            step=step_id, reason=reason, will_retry=will_retry,
+            attempt=attempt, budget=budget,
         )
 
     def check(
@@ -124,6 +150,15 @@ class EventLog:
             step=step_id, target=target, before_pct=before_pct,
             threshold=threshold, before_tokens=before_tokens,
             after_tokens=after_tokens, after_pct=after_pct,
+        )
+
+    def resumed(self, source_run_id: str, *, steps: list[str]) -> None:
+        joined = ", ".join(steps) if steps else "(none)"
+        self.emit(
+            "resumed",
+            f"resuming from {source_run_id}: skipping {len(steps)} "
+            f"completed step(s) [{joined}]",
+            source_run_id=source_run_id, steps=steps,
         )
 
     def pipeline_done(self, *, status: str, reason: str) -> None:

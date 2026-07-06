@@ -27,6 +27,59 @@ def _last_nonempty_line(text: str) -> str:
     return ""
 
 
+# How many times to re-run a step whose outcome was abnormal (errored, hit an
+# API error, or produced no body when one was contracted). These are transient
+# by nature — an API 429/500/529 or an empty reply usually clears on one retry —
+# so they get their own budget, independent of `step.retry` (which the author
+# tunes for the semantic REJECT loop and may deliberately set to 0). Kept at 1:
+# a single retry recovers the common transient blip, while a second rarely helps
+# and would double the worst-case cost on expensive steps (analyze runs ~1h).
+ABNORMAL_RETRY_BUDGET = 1
+
+
+def _classify_outcome(step: StepDef, result: StepResult) -> tuple[str, str]:
+    """Sort a step result into ok / abnormal_fatal / abnormal_routable.
+
+    The distinction that matters: a step that errored or returned an empty body
+    produced *no verdict*. It must never be fed to a check and turned into a
+    "failure" that a REJECT route then acts on — an empty mini-review is not a
+    rejection of the analysis, it's a step that didn't run. Nor may a step that
+    broke its output contract (declared `output`, wrote nothing) proceed, since
+    a downstream `inject` of that missing file would crash the run.
+
+    Returns (outcome, reason):
+      - "ok": real body produced; run the check / write output as normal.
+      - "abnormal_fatal": errored/empty on a step that has a check (would fake a
+        REJECT) or broke its output contract (would crash downstream). Retried
+        within ABNORMAL_RETRY_BUDGET, then hard-fails the pipeline — never routed.
+      - "abnormal_routable": errored on a step with no check and no output
+        contract, e.g. a timeout on a plain step whose `if: failure` route is
+        genuine error handling. Keeps the legacy failure-routing behavior.
+    """
+    empty = not (result.output_text or "").strip()
+    # A step is contracted to produce a body when it declares an output file or
+    # when its check reads the reply directly (a check with no prompt of its own).
+    contracted = bool(step.output) or bool(step.check and not step.check.prompt)
+    errored = result.is_error or bool(result.api_error_status)
+
+    if not errored and not (contracted and empty):
+        return "ok", ""
+
+    if errored:
+        reason = (
+            f"errored (is_error={result.is_error}, subtype={result.subtype}, "
+            f"api_error_status={result.api_error_status})"
+        )
+    else:
+        reason = "empty output (step was contracted to produce a body)"
+
+    # Fatal when there's a verdict to protect (has a check) or a contract broken
+    # (empty body a downstream inject depends on). Otherwise fall back to routing.
+    if step.check or (contracted and empty):
+        return "abnormal_fatal", reason
+    return "abnormal_routable", reason
+
+
 class ExecutionEngine:
     """Stateful engine that handles DAG execution + routing + loops."""
 
@@ -38,6 +91,8 @@ class ExecutionEngine:
         concurrency: int = 0,
         dry_run: bool = False,
         verbose: bool = False,
+        resume_run_id: str | None = None,
+        resume_last: bool = False,
     ):
         self.pipeline = pipeline
         self.inputs = inputs
@@ -45,6 +100,13 @@ class ExecutionEngine:
         self.concurrency = concurrency
         self.dry_run = dry_run
         self.verbose = verbose
+        # Resume config. When resolved (in run(), before the new run dir is
+        # created), the successful steps of the chosen prior run are rehydrated
+        # into self.results so they're skipped and their session_ids stay
+        # available to any resume: target. resume_last picks the newest run;
+        # resume_run_id names one explicitly (takes precedence). None = fresh.
+        self.resume_run_id = resume_run_id
+        self.resume_last = resume_last
 
         self.step_map = {s.id: s for s in pipeline.steps}
         # Dependency graph is a pure function of the (immutable) pipeline, so
@@ -80,6 +142,18 @@ class ExecutionEngine:
 
         # Initialize persistence
         base_dir = self.workdir or str(Path.cwd())
+
+        # Resolve --resume-last to a concrete run id NOW, before RunStore below
+        # creates a fresh (and thus "latest") run dir. An explicit id wins; if
+        # neither yields a run, this is just a normal fresh run.
+        if self.resume_run_id is None and self.resume_last:
+            self.resume_run_id = RunStore.find_latest_run(base_dir)
+            if self.resume_run_id is None:
+                self.events.emit(
+                    "resume_noop", "  --resume-last: no prior run found, "
+                    "starting fresh",
+                )
+
         self.store = RunStore(base_dir, self.pipeline.name, self.inputs, self.workdir)
         self.events = EventLog(self.store.run_dir)
         # Detailed agent logs (prompts, tool/shell calls, check I/O) go to a file
@@ -97,6 +171,12 @@ class ExecutionEngine:
         layers = topological_layers(self.pipeline, self.dag)
 
         try:
+            # Rehydrate a prior run's completed steps into results so they're
+            # skipped below. Inside the try so a bad --resume id surfaces as a
+            # caught pipeline failure, not a raw traceback.
+            if self.resume_run_id:
+                self._seed_from_prior_run(base_dir)
+
             for layer in layers:
                 # Skip steps already run via an earlier goto (a forward-goto
                 # fan-out or a max_iterations escape can execute a step before
@@ -132,6 +212,41 @@ class ExecutionEngine:
         if route_done:
             return f"reached {route_done[-1]}"
         return "all steps completed"
+
+    def _seed_from_prior_run(self, base_dir: str) -> None:
+        """Load a prior run's successful steps into results so they're skipped.
+
+        Only steps that still exist in the current pipeline are seeded — a step
+        renamed or removed since the prior run is silently ignored, so a stale
+        artifact can't resurrect a step the DAG no longer knows about. The
+        top-level walk (and every goto) already skips any step present in
+        results, so seeding is all that's needed to make them no-ops.
+        """
+        run_id = self.resume_run_id
+        assert run_id is not None
+        try:
+            loaded = RunStore.load_completed_steps(base_dir, run_id)
+        except FileNotFoundError as e:
+            raise ExecutionError(str(e)) from e
+        seeded: list[str] = []
+        for sid, rs in loaded.items():
+            if sid not in self.step_map:
+                continue
+            self.results[sid] = StepResult(
+                session_id=rs.session_id,
+                output_text=rs.output_text,
+                check_output=rs.check_output,
+            )
+            # Count the seeded run as this step's first execution, so if a
+            # back-jump later re-runs it, its re-execution persists to run-2/
+            # rather than clobbering the seed. The step's inject artifacts
+            # (output.md written to the workdir by the prior run) already sit in
+            # the workdir, where inject resolves them — no need to copy them.
+            self.execution_counts[sid] = 1
+            seeded.append(sid)
+
+        self.store.record_resumed_from(run_id, seeded)
+        self.events.resumed(run_id, steps=seeded)
 
     async def _execute_layer(self, step_ids: list[str]) -> None:
         """Execute a layer of steps concurrently."""
@@ -174,28 +289,78 @@ class ExecutionEngine:
         # the CLI) so this step continues on a lighter context.
         await self._maybe_compact(step)
 
+        # Two independent retry budgets, because two unrelated things fail here:
+        #  · abnormal outcomes (errored / API error / empty body) are transient
+        #    infrastructure hiccups — retried on ABNORMAL_RETRY_BUDGET.
+        #  · a semantic REJECT (ok body, check says no) is a real verdict —
+        #    retried on step.retry, then routed via `if: failure`.
+        # An abnormal outcome never becomes a check-failure, so an empty reply
+        # can no longer masquerade as a REJECT and trigger a revise loop.
         max_retries = step.retry or 0
         last_result: StepResult | None = None
+        reject_retries = 0    # semantic REJECT re-runs used (bounded by max_retries)
+        abnormal_retries = 0  # abnormal re-runs used (bounded by ABNORMAL_RETRY_BUDGET)
+        run_index = 0         # total provider.run calls; >0 means "inject retry feedback"
 
-        for attempt in range(max_retries + 1):
-            prompt = self._build_step_prompt(step, last_result, attempt)
-            options = self._build_run_options(step, attempt)
+        while True:
+            prompt = self._build_step_prompt(step, last_result, run_index)
+            options = self._build_run_options(step, run_index)
 
             result = await self.provider.run(prompt, options)
+            outcome, reason = _classify_outcome(step, result)
             self.events.step_result(
                 step.id, execution=execution,
                 provider_status="error" if result.is_error else "ok",
                 turns=result.num_turns, duration_ms=result.duration_ms,
                 cost_usd=result.cost_usd,
+                subtype=result.subtype, stop_reason=result.stop_reason,
+                api_error_status=result.api_error_status,
+                output_empty=not (result.output_text or "").strip(),
             )
 
+            # --- Abnormal outcome: no trustworthy answer was produced ---------
+            # An errored / empty step produced no verdict. It never becomes a
+            # check-failure, so an empty reply can't masquerade as a REJECT and
+            # trigger a revise loop.
+            if outcome.startswith("abnormal"):
+                will_retry = abnormal_retries < ABNORMAL_RETRY_BUDGET
+                self.events.step_abnormal(
+                    step.id, reason=reason, will_retry=will_retry,
+                    attempt=abnormal_retries + 1, budget=ABNORMAL_RETRY_BUDGET,
+                )
+                if will_retry:
+                    abnormal_retries += 1
+                    run_index += 1
+                    last_result = result
+                    continue
+                # Budget spent. Persist as a failure either way.
+                self.results[step.id] = result
+                if self.store:
+                    self.store.save_step_result(
+                        step.id, result, "failure", abnormal_retries, execution
+                    )
+                # Fatal abnormal (a check to protect, or a broken output
+                # contract) aborts rather than routing a fake REJECT / crashing
+                # a downstream inject. A routable one (plain errored step with a
+                # real `if: failure` handler) keeps the legacy behavior.
+                if outcome == "abnormal_fatal":
+                    raise ExecutionError(
+                        f"Step '{step.id}' produced no usable output after "
+                        f"{abnormal_retries + 1} attempt(s): {reason}. Treated as "
+                        f"a step failure, not a rejection of the analysis — so it "
+                        f"is not routed to a revise/failure branch."
+                    )
+                await self._handle_routes(step, "failure")
+                return
+
+            # --- Normal outcome: real body produced ---------------------------
             # Write output file if specified
             if step.output and result.output_text:
                 self._write_output(step.output, result.output_text)
 
             # Run check if defined
             status = "success"
-            if step.check and not result.is_error:
+            if step.check:
                 if step.check.prompt:
                     check_output = await self.provider.check(
                         result.session_id, step.check.prompt, self.workdir
@@ -205,33 +370,34 @@ class ExecutionEngine:
                 result.check_output = check_output
                 status = await self._evaluate_check(step, check_output)
 
-            if result.is_error:
-                status = "failure"
-
             if status in ("success", "routed"):
                 self.results[step.id] = result
                 if self.store:
                     self.store.save_step_result(
-                        step.id, result, "success", attempt, execution
+                        step.id, result, "success", reject_retries, execution
                     )
                 # "routed" means check.routes already dispatched the goto.
                 if status == "success":
                     await self._handle_routes(step, "success")
                 return
 
-            # Failed — retry or give up
+            # Semantic REJECT — retry on the author's budget, then route failure.
             last_result = result
-            if attempt < max_retries:
-                self.events.retry(step.id, attempt=attempt + 1, max_retries=max_retries)
+            if reject_retries < max_retries:
+                reject_retries += 1
+                run_index += 1
+                self.events.retry(
+                    step.id, attempt=reject_retries, max_retries=max_retries
+                )
                 continue
 
-        # All retries exhausted
-        self.results[step.id] = last_result  # type: ignore[assignment]
-        if self.store and last_result:
-            self.store.save_step_result(
-                step.id, last_result, "failure", max_retries, execution
-            )
-        await self._handle_routes(step, "failure")
+            self.results[step.id] = result
+            if self.store:
+                self.store.save_step_result(
+                    step.id, result, "failure", max_retries, execution
+                )
+            await self._handle_routes(step, "failure")
+            return
 
     def _assert_resumable(self, step: StepDef) -> None:
         """Reject a resume whose target ran but produced no session.
