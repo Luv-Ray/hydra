@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import sys
+import json
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol, TextIO
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, ResultMessage, query
-from claude_agent_sdk.types import AssistantMessage, ToolUseBlock, TextBlock
+from claude_agent_sdk.types import (
+    AssistantMessage,
+    TextBlock,
+    ThinkingBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+)
 
 
 @dataclass
@@ -24,6 +32,12 @@ class StepRunOptions:
     mcp_servers: dict[str, Any] | None = None
     # Pipeline-wide system_prompt, appended to the built-in automation prompt.
     extra_system_prompt: str | None = None
+    # Where to write the full, untruncated message transcript for this run. One
+    # JSON object per SDK message (every content block: text/thinking/tool_use/
+    # tool_result, plus system/user-injected messages). Always written when set,
+    # independent of verbose — this is the record that lets an empty/abnormal
+    # output be diagnosed without re-running the step. None disables it.
+    transcript_path: str | None = None
 
 
 @dataclass
@@ -80,6 +94,71 @@ def _extract_context(msg: ResultMessage) -> tuple[int, int]:
     usage = msg.usage or {}
     return int(usage.get("input_tokens", 0)), 0
 
+def _block_to_dict(block: Any) -> dict[str, Any]:
+    """Serialize one assistant/user content block, untruncated.
+
+    Covers the block types that matter for diagnosing an empty/abnormal output:
+    text (the visible reply), thinking (reasoning that produced no visible
+    text), tool_use (what it tried to call), tool_result. Unknown block types
+    fall back to a repr so nothing is silently dropped.
+    """
+    if isinstance(block, TextBlock):
+        return {"type": "text", "text": block.text}
+    if isinstance(block, ThinkingBlock):
+        return {"type": "thinking", "thinking": block.thinking}
+    if isinstance(block, ToolUseBlock):
+        return {"type": "tool_use", "name": block.name, "input": block.input}
+    if isinstance(block, ToolResultBlock):
+        return {
+            "type": "tool_result",
+            "tool_use_id": getattr(block, "tool_use_id", None),
+            "content": getattr(block, "content", None),
+            "is_error": getattr(block, "is_error", None),
+        }
+    return {"type": type(block).__name__, "repr": repr(block)[:2000]}
+
+
+def _message_to_dict(msg: Any) -> dict[str, Any]:
+    """Serialize any SDK message to a plain dict for the transcript.
+
+    AssistantMessage/UserMessage carry content blocks; ResultMessage carries the
+    termination summary; system/hook messages are captured by attribute dump so
+    an injected nudge (e.g. "your previous response had no visible output") is
+    preserved. Everything is JSON-serializable via a str() fallback.
+    """
+    kind = type(msg).__name__
+    out: dict[str, Any] = {"kind": kind}
+    content = getattr(msg, "content", None)
+    if isinstance(content, list):
+        out["content"] = [_block_to_dict(b) for b in content]
+    elif content is not None:
+        out["content"] = content
+    if isinstance(msg, ResultMessage):
+        out.update(
+            subtype=msg.subtype,
+            is_error=msg.is_error,
+            stop_reason=msg.stop_reason,
+            num_turns=msg.num_turns,
+            duration_ms=msg.duration_ms,
+            total_cost_usd=msg.total_cost_usd,
+            result=msg.result,
+            usage=msg.usage,
+            model_usage=msg.model_usage,
+            api_error_status=getattr(msg, "api_error_status", None),
+            errors=msg.errors,
+        )
+    else:
+        # For non-Assistant/Result messages (system init, hook events), dump the
+        # raw data dict if present so nothing about the environment is lost.
+        data = getattr(msg, "data", None)
+        if data is not None and "content" not in out:
+            out["data"] = data
+        subtype = getattr(msg, "subtype", None)
+        if subtype is not None:
+            out["subtype"] = subtype
+    return out
+
+
 SYSTEM_PROMPT = (
     "You are running in a fully automated pipeline. "
     "There is no human operator to answer questions or confirm decisions. "
@@ -105,6 +184,7 @@ class ClaudeProvider:
     def __init__(self, verbose: bool = False):
         self.verbose = verbose
         self._trace: TextIO | None = None
+        self._transcript: TextIO | None = None
 
     def set_trace_file(self, path: Path | None) -> None:
         """Route the detailed agent trace (prompts, tool calls, check I/O) to a
@@ -140,6 +220,11 @@ class ClaudeProvider:
 
         self._log_prompt(prompt, options)
 
+        # Full untruncated transcript for this run (see StepRunOptions). Record
+        # the prompt we sent first, then every message as it streams in.
+        self._transcript_open(options.transcript_path)
+        self._transcript_write({"kind": "prompt", "text": prompt})
+
         session_id: str | None = None
         result_text: str | None = None
         is_error = False
@@ -158,6 +243,7 @@ class ClaudeProvider:
             nonlocal duration_ms, num_turns, input_tokens, context_window
             nonlocal subtype, stop_reason, api_error_status, errors
             async for msg in query(prompt=prompt, options=sdk_options):
+                self._transcript_write(_message_to_dict(msg))
                 if isinstance(msg, AssistantMessage):
                     self._log_assistant(msg, options.step_id)
                 elif isinstance(msg, ResultMessage):
@@ -188,6 +274,10 @@ class ClaudeProvider:
                 await _consume()
         except asyncio.TimeoutError:
             self._log(f"step '{options.step_id}' timed out after {options.timeout}s")
+            self._transcript_write(
+                {"kind": "timeout", "after_s": options.timeout}
+            )
+            self._transcript_close()
             # session_id may be None here if the timeout fired before any
             # ResultMessage arrived. Surface that honestly rather than inventing
             # a "timeout-<id>" string — a fake id would sail through resume and
@@ -202,6 +292,8 @@ class ClaudeProvider:
                 api_error_status=api_error_status,
                 errors=errors,
             )
+
+        self._transcript_close()
 
         if session_id is None:
             raise RuntimeError(f"Step '{options.step_id}' did not return a session ID")
@@ -294,6 +386,39 @@ class ClaudeProvider:
                 return 0, 0
         finally:
             await client.disconnect()
+
+    def _transcript_open(self, path: str | None) -> None:
+        """Open (truncate) the per-run transcript file. No-op when path is None.
+
+        Truncates so a retry's transcript reflects that attempt, not a stale
+        concatenation — the run dir keeps prior attempts under run-N/ anyway.
+        """
+        if self._transcript:
+            self._transcript.close()
+            self._transcript = None
+        if path:
+            self._transcript = Path(path).open("w")
+
+    def _transcript_write(self, record: dict[str, Any]) -> None:
+        """Append one JSON record to the transcript, if one is open."""
+        if not self._transcript:
+            return
+        record = {"ts": datetime.now(timezone.utc).isoformat(), **record}
+        try:
+            line = json.dumps(record, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            line = json.dumps(
+                {"ts": record["ts"], "kind": record.get("kind", "?"),
+                 "unserializable": repr(record)[:2000]},
+                ensure_ascii=False,
+            )
+        self._transcript.write(line + "\n")
+        self._transcript.flush()
+
+    def _transcript_close(self) -> None:
+        if self._transcript:
+            self._transcript.close()
+            self._transcript = None
 
     def _log(self, message: str) -> None:
         """Write a detail line to the agent trace file (category 2).

@@ -304,7 +304,7 @@ class ExecutionEngine:
 
         while True:
             prompt = self._build_step_prompt(step, last_result, run_index)
-            options = self._build_run_options(step, run_index)
+            options = self._build_run_options(step, run_index, execution)
 
             result = await self.provider.run(prompt, options)
             outcome, reason = _classify_outcome(step, result)
@@ -502,11 +502,22 @@ class ExecutionEngine:
             preamble=self.pipeline.prompt_preamble,
         )
 
-    def _build_run_options(self, step: StepDef, attempt: int) -> StepRunOptions:
+    def _build_run_options(
+        self, step: StepDef, attempt: int, execution: int
+    ) -> StepRunOptions:
         """Build provider run options for a step."""
         resume_session_id: str | None = None
         if step.resume and step.resume in self.results:
             resume_session_id = self.results[step.resume].session_id
+
+        # Full transcript lands in the step's run dir alongside its output/meta.
+        # attempt>0 (a retry) gets a suffixed file so an earlier attempt's
+        # transcript — often the one that captured the failure — isn't clobbered.
+        transcript_path: str | None = None
+        if self.store:
+            d = self.store.step_dir(step.id, execution)
+            name = "transcript.jsonl" if attempt == 0 else f"transcript.attempt-{attempt}.jsonl"
+            transcript_path = str(d / name)
 
         return StepRunOptions(
             step_id=step.id,
@@ -518,6 +529,7 @@ class ExecutionEngine:
             resume_session_id=resume_session_id,
             mcp_servers=self.pipeline.mcp_servers or None,
             extra_system_prompt=self.pipeline.system_prompt,
+            transcript_path=transcript_path,
         )
 
     async def _evaluate_check(self, step: StepDef, check_output: str) -> str:
