@@ -25,6 +25,16 @@ def cli() -> None:
 @click.option("--concurrency", type=int, default=0, help="Max concurrent steps (0=unlimited)")
 @click.option("--dry-run", is_flag=True, help="Show execution plan without running")
 @click.option("-v", "--verbose", is_flag=True, help="Verbose logging (include assistant text)")
+@click.option(
+    "--resume-last", is_flag=True,
+    help="Continue the most recent prior run: skip its successfully-completed "
+    "steps and re-run the rest (the interrupted/failed step onward).",
+)
+@click.option(
+    "--resume", "resume_run_id", metavar="RUN_ID", default=None,
+    help="Continue a specific prior run by id (see .hydra/runs/). "
+    "Takes precedence over --resume-last.",
+)
 def run(
     pipeline_file: str,
     var: tuple[str, ...],
@@ -32,6 +42,8 @@ def run(
     concurrency: int,
     dry_run: bool,
     verbose: bool,
+    resume_last: bool,
+    resume_run_id: str | None,
 ) -> None:
     """Execute a pipeline."""
     vars_dict = _parse_vars(var)
@@ -48,6 +60,8 @@ def run(
             concurrency=concurrency,
             dry_run=dry_run,
             verbose=verbose,
+            resume_run_id=resume_run_id,
+            resume_last=resume_last,
         )
         result = asyncio.run(engine.run())
 
