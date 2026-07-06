@@ -98,7 +98,16 @@ class ExecutionEngine:
 
         try:
             for layer in layers:
-                active = [sid for sid in layer if sid not in self.skipped]
+                # Skip steps already run via an earlier goto (a forward-goto
+                # fan-out or a max_iterations escape can execute a step before
+                # the top-level walk reaches its layer). Back-jumps re-run their
+                # loop body through their own internal loop, never here, so a
+                # step already in results when its layer arrives genuinely ran
+                # and must not repeat.
+                active = [
+                    sid for sid in layer
+                    if sid not in self.skipped and sid not in self.results
+                ]
                 if not active:
                     continue
                 await self._execute_layer(active)
@@ -154,6 +163,12 @@ class ExecutionEngine:
         )
         if self.store:
             self.store.save_step_start(step.id, execution)
+
+        # A step can only resume a target that actually produced a session. If
+        # the target ran but has no session_id (e.g. it timed out before any
+        # result), resuming it is impossible — fail loudly here rather than
+        # handing a missing session to compact/run and crashing inside the SDK.
+        self._assert_resumable(step)
 
         # Before resuming a heavy session, compact it in place (like /compact in
         # the CLI) so this step continues on a lighter context.
@@ -217,6 +232,26 @@ class ExecutionEngine:
                 step.id, last_result, "failure", max_retries, execution
             )
         await self._handle_routes(step, "failure")
+
+    def _assert_resumable(self, step: StepDef) -> None:
+        """Reject a resume whose target ran but produced no session.
+
+        Only fires when the target is present in results (it executed) yet has a
+        None session_id — the signature of a step that failed before the SDK
+        returned a session (a pre-result timeout). A target that hasn't run yet
+        is not an error here: resume degrades to a fresh session in that case
+        (see _build_run_options), which is the intended first-pass/back-jump
+        behavior.
+        """
+        if not step.resume:
+            return
+        target = self.results.get(step.resume)
+        if target is not None and target.session_id is None:
+            raise ExecutionError(
+                f"Step '{step.id}' cannot resume '{step.resume}': the target "
+                f"produced no session (it likely failed or timed out). Route the "
+                f"failure explicitly instead of resuming a dead session."
+            )
 
     async def _maybe_compact(self, step: StepDef) -> None:
         """Compact the resume target in place when it exceeds the step's threshold.
@@ -298,6 +333,7 @@ class ExecutionEngine:
             retry_feedback=retry_feedback,
             output_path=step.output,
             allow_missing=allow_missing,
+            preamble=self.pipeline.prompt_preamble,
         )
 
     def _build_run_options(self, step: StepDef, attempt: int) -> StepRunOptions:
@@ -315,6 +351,7 @@ class ExecutionEngine:
             cwd=self.workdir,
             resume_session_id=resume_session_id,
             mcp_servers=self.pipeline.mcp_servers or None,
+            extra_system_prompt=self.pipeline.system_prompt,
         )
 
     async def _evaluate_check(self, step: StepDef, check_output: str) -> str:
@@ -400,7 +437,7 @@ class ExecutionEngine:
             self.iteration_counts[origin_step.id] = count
             max_iter = origin_step.max_iterations or 10
 
-            subgraph = self._find_subgraph(targets, origin_step.id)
+            subgraph = self._resolve_subgraph(targets, origin_step)
             self.events.back_jump(
                 origin_step.id, targets=targets, subgraph=subgraph,
                 iteration=count, max_iterations=max_iter,
@@ -524,14 +561,44 @@ class ExecutionEngine:
             if target not in self.results and target not in self.skipped:
                 await self._execute_step(target)
 
+    def _resolve_subgraph(
+        self, targets: list[str], origin: StepDef
+    ) -> list[str]:
+        """The loop body to re-run on origin's back-jump.
+
+        Prefers origin's author-declared ``loop_body`` (explicit, validate-
+        checked). Falls back to reverse-derivation (_find_subgraph) when it is
+        omitted, preserving backward compatibility for pipelines that rely on
+        inference. Declared bodies are returned in pipeline order so back-jump
+        re-execution layers them deterministically.
+        """
+        if origin.loop_body is not None:
+            order = {s.id: i for i, s in enumerate(self.pipeline.steps)}
+            return sorted(origin.loop_body, key=lambda x: order.get(x, 0))
+        return self._find_subgraph(targets, origin.id)
+
     def _find_subgraph(self, targets: list[str], origin_id: str) -> list[str]:
-        """Find all DAG steps between targets and origin (topological order).
+        """Find the loop body: DAG steps between targets and origin (topo order).
 
         Excludes trigger:route steps — they are only reached via explicit goto,
         not as part of subgraph re-execution.
+
+        Stops the walk at *branch steps* (steps carrying routes / check.routes).
+        A branch step's DAG dependents are its forward *exit* — reached only when
+        its check passes — not part of the loop body. Re-running the branch step
+        itself re-issues the goto that closes the loop, so the walk must not
+        descend past it. Without this, a cheap gate that fans out to expensive
+        downstream steps on success (e.g. mini-review → parallel deep review)
+        would drag that whole fan-out into every revise iteration: the very
+        reason the fan-out used to be mis-wired to a common upstream dep instead
+        of the gate. The branch step itself stays in the subgraph.
         """
         dag = self.dag
         route_steps = {s.id for s in self.pipeline.steps if s.trigger == "route"}
+        branch_steps = {
+            s.id for s in self.pipeline.steps
+            if s.routes or (s.check and s.check.routes)
+        }
 
         # Build reverse DAG (step → its dependents)
         reverse: dict[str, list[str]] = {s.id: [] for s in self.pipeline.steps}
@@ -549,6 +616,9 @@ class ExecutionEngine:
             if current == origin_id:
                 continue
             visited.add(current)
+            # Branch step: include it but do not descend into its exit path.
+            if current in branch_steps:
+                continue
             for dependent in reverse.get(current, []):
                 if dependent == origin_id or dependent in visited:
                     continue

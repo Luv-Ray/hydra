@@ -13,14 +13,17 @@ def build_prompt(
     retry_feedback: str | None = None,
     output_path: str | None = None,
     allow_missing: bool = False,
+    preamble: str | None = None,
 ) -> str:
-    """Assemble the full prompt: retry feedback + inject content + step prompt.
+    """Assemble the full prompt: preamble + retry feedback + inject + step prompt.
 
     Args:
         prompt: The step's prompt text (already template-expanded).
         inject_paths: File paths and glob patterns to inject.
         workdir: Working directory for resolving relative paths.
         retry_feedback: Optional feedback from previous attempt to prepend.
+        preamble: Pipeline-wide text prepended before everything else (applied
+            to every step). Already template-expanded by the loader.
         output_path: If set, the step captures the reply body into this file.
             A contract note is appended so the model understands its reply IS
             the artifact, not a chat message about the work.
@@ -32,6 +35,9 @@ def build_prompt(
             skip non-matches regardless of this flag.
     """
     parts: list[str] = []
+
+    if preamble:
+        parts.append(preamble)
 
     if retry_feedback:
         parts.append(retry_feedback)

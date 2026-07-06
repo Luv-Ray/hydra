@@ -94,6 +94,11 @@ class StepDef:
     allowed_tools: list[str] | None = None
     max_turns: int | None = None
     max_iterations: int | None = None
+    # Explicit loop body: the DAG steps to re-run on this step's back-jump.
+    # When set, it replaces the engine's reverse-derivation (_find_subgraph),
+    # making the loop body author-declared and validate-checkable rather than
+    # inferred. Omit to fall back to derivation. See _resolve_subgraph.
+    loop_body: list[str] | None = None
     routes: list[RouteDef] | None = None
     check: CheckDef | None = None
     when: str | None = None
@@ -108,6 +113,10 @@ class StepDef:
         inject = d.get("inject", [])
         if isinstance(inject, str):
             inject = [inject]
+
+        loop_body = d.get("loop_body")
+        if isinstance(loop_body, str):
+            loop_body = [loop_body]
 
         routes = None
         if "routes" in d:
@@ -132,6 +141,7 @@ class StepDef:
             allowed_tools=d.get("allowed_tools"),
             max_turns=d.get("max_turns"),
             max_iterations=d.get("max_iterations"),
+            loop_body=loop_body,
             routes=routes,
             check=check,
             when=d.get("when"),
@@ -148,3 +158,10 @@ class Pipeline:
     defaults: DefaultsDef = field(default_factory=DefaultsDef)
     workdir: str | None = None
     mcp_servers: dict[str, Any] = field(default_factory=dict)
+    # Applied to every step. system_prompt is appended to the engine's built-in
+    # automation system prompt (role/discipline that spans the whole run, sent
+    # out-of-band from the step instruction). prompt_preamble is prepended to
+    # each step's user prompt (operational context repeated per step). See loader
+    # / executor / provider for how each threads through.
+    system_prompt: str | None = None
+    prompt_preamble: str | None = None

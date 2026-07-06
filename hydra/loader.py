@@ -54,6 +54,15 @@ def load_pipeline(
     if workdir:
         workdir = expand_template(workdir, resolved_inputs)
 
+    # Pipeline-wide prompt fields; template-expanded like step prompts so they
+    # can reference {{ inputs.x }}.
+    system_prompt = data.get("system_prompt")
+    if system_prompt:
+        system_prompt = expand_template(system_prompt, resolved_inputs)
+    prompt_preamble = data.get("prompt_preamble")
+    if prompt_preamble:
+        prompt_preamble = expand_template(prompt_preamble, resolved_inputs)
+
     return Pipeline(
         name=data.get("name", path.stem),
         version=data.get("version", 1),
@@ -62,6 +71,8 @@ def load_pipeline(
         defaults=defaults,
         workdir=workdir,
         mcp_servers=data.get("mcp_servers", {}),
+        system_prompt=system_prompt,
+        prompt_preamble=prompt_preamble,
     )
 
 

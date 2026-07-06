@@ -26,6 +26,7 @@ def validate_pipeline(pipeline: Pipeline) -> list[str]:
     _check_route_targets(pipeline.steps, step_ids)
     _check_trigger_route_reachable(pipeline.steps, step_ids, warnings)
     _check_loop_protection(pipeline.steps, step_map)
+    _check_loop_body(pipeline.steps, step_ids, step_map)
     _check_when_syntax(pipeline.steps)
     _check_check_fields(pipeline.steps)
     _check_glob_without_after(pipeline.steps, output_map, warnings)
@@ -147,6 +148,57 @@ def _check_loop_protection(
                             f"Step '{step.id}': goto back-jump to '{t}' requires "
                             f"max_iterations to prevent infinite loops"
                         )
+
+
+def _check_loop_body(
+    steps: list[StepDef],
+    step_ids: set[str],
+    step_map: dict[str, StepDef],
+) -> None:
+    """Validate explicit loop_body declarations (catch author typos early).
+
+    A declared loop_body replaces the engine's reverse-derivation, so a typo'd
+    or malformed member would silently re-run the wrong set. Enforce that:
+      - every member is a real step id;
+      - members are DAG steps (trigger != route) — route steps are reached only
+        via goto, never as part of subgraph re-execution;
+      - the step does not list itself (origin is re-run separately);
+      - the declaring step actually has a back-jump route (else loop_body is
+        dead config).
+    """
+    step_order = {s.id: i for i, s in enumerate(steps)}
+    for step in steps:
+        if step.loop_body is None:
+            continue
+
+        has_back_jump = False
+        for route in step.routes or []:
+            targets = route.goto if isinstance(route.goto, list) else [route.goto]
+            if any(
+                t in step_order and step_order[t] <= step_order[step.id]
+                for t in targets
+            ):
+                has_back_jump = True
+        if not has_back_jump:
+            raise ValidationError(
+                f"Step '{step.id}': declares loop_body but has no back-jump route "
+                f"— loop_body only applies to a step that jumps backward"
+            )
+
+        for member in step.loop_body:
+            if member not in step_ids:
+                raise ValidationError(
+                    f"Step '{step.id}': loop_body references unknown step '{member}'"
+                )
+            if member == step.id:
+                raise ValidationError(
+                    f"Step '{step.id}': loop_body must not list the step itself"
+                )
+            if step_map[member].trigger == "route":
+                raise ValidationError(
+                    f"Step '{step.id}': loop_body member '{member}' is trigger:route; "
+                    f"only DAG steps can be part of a re-executed loop body"
+                )
 
 
 def _check_when_syntax(steps: list[StepDef]) -> None:

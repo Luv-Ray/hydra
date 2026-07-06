@@ -263,3 +263,49 @@ def test_max_iterations_escape_looping_back_is_rejected(tmp_path: Path):
     result = asyncio.run(engine.run())
 
     assert result == "failure"
+
+
+class TimeoutThenResumeProvider:
+    """First step 'times out' (session_id=None, is_error), rest succeed.
+
+    Mirrors a pre-result timeout: the failed step produced no SDK session, so a
+    downstream step that resumes it must be rejected rather than handed a fake id.
+    """
+
+    def __init__(self):
+        self.calls: list[str] = []
+
+    async def run(self, prompt: str, options: StepRunOptions) -> StepResult:
+        self.calls.append(options.step_id)
+        if options.step_id == "analyze":
+            return StepResult(session_id=None, output_text="", is_error=True)
+        return StepResult(session_id=f"sess-{options.step_id}", output_text="ok")
+
+    async def check(self, session_id, prompt, cwd=None):
+        return "yes"
+
+    async def compact(self, session_id, model=None, cwd=None):
+        return (0, 0)
+
+
+def test_resume_of_sessionless_step_is_rejected(tmp_path: Path):
+    # analyze times out (no session) but routes its failure forward to review,
+    # which resumes analyze. Resuming a dead session must raise, not fabricate.
+    content = (
+        "name: resume-dead\nversion: 1\n\nsteps:\n"
+        "  - id: analyze\n    prompt: \"analyze\"\n"
+        "    routes:\n      - if: failure\n        goto: review\n"
+        "  - id: review\n    trigger: route\n    resume: analyze\n    prompt: \"review\"\n"
+    )
+    p = tmp_path / "pipeline.yaml"
+    p.write_text(content)
+    pipeline = load_pipeline(p)
+    pipeline.workdir = str(tmp_path)
+    engine = ExecutionEngine(
+        pipeline=pipeline, inputs={}, provider=TimeoutThenResumeProvider()
+    )
+    result = asyncio.run(engine.run())
+
+    # The resume guard raises ExecutionError inside review, which run() catches
+    # and turns into a failed pipeline (not a crash deep in the SDK).
+    assert result == "failure"

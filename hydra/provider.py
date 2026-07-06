@@ -22,11 +22,16 @@ class StepRunOptions:
     cwd: str | None = None
     resume_session_id: str | None = None
     mcp_servers: dict[str, Any] | None = None
+    # Pipeline-wide system_prompt, appended to the built-in automation prompt.
+    extra_system_prompt: str | None = None
 
 
 @dataclass
 class StepResult:
-    session_id: str
+    # None when the step produced no real SDK session (e.g. it timed out before
+    # any ResultMessage arrived). Downstream resume treats a None target session
+    # as a hard error rather than fabricating a fake id that the SDK can't find.
+    session_id: str | None
     output_text: str
     check_output: str | None = None
     is_error: bool = False
@@ -104,10 +109,13 @@ class ClaudeProvider:
         self._trace = path.open("a") if path else None
 
     async def run(self, prompt: str, options: StepRunOptions) -> StepResult:
+        system_prompt = SYSTEM_PROMPT
+        if options.extra_system_prompt:
+            system_prompt = f"{SYSTEM_PROMPT}\n\n{options.extra_system_prompt}"
         sdk_options = ClaudeAgentOptions(
             allowed_tools=options.allowed_tools or DEFAULT_TOOLS,
             permission_mode="bypassPermissions",
-            system_prompt=SYSTEM_PROMPT,
+            system_prompt=system_prompt,
         )
 
         if options.model:
@@ -160,8 +168,12 @@ class ClaudeProvider:
                 await _consume()
         except asyncio.TimeoutError:
             self._log(f"step '{options.step_id}' timed out after {options.timeout}s")
+            # session_id may be None here if the timeout fired before any
+            # ResultMessage arrived. Surface that honestly rather than inventing
+            # a "timeout-<id>" string — a fake id would sail through resume and
+            # only blow up deep in the SDK with "No conversation found".
             return StepResult(
-                session_id=session_id or f"timeout-{options.step_id}",
+                session_id=session_id,
                 output_text=result_text or "",
                 is_error=True,
                 duration_ms=(options.timeout or 0) * 1000,
