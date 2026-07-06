@@ -53,4 +53,3 @@ loader.py → validate.py → dag.py → executor.py
 
 - **改代码前先读代码核对**,尤其涉及 SDK 行为(usage/context/compaction 这类)时,用 venv 起小脚本实测,不要凭假设下结论。
 - **不确定就诚实说**,包括"我上一轮的建议错了"。给的数字/阈值要标明是实测还是外推。
-- 提交代码只在用户明确要求时做;当前分支若是主干先开分支。
