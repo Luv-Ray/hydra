@@ -52,7 +52,10 @@ class StepResult:
     cost_usd: float | None = None
     duration_ms: int = 0
     num_turns: int = 0
-    # Context accounting (from model_usage) — drives compact_before_resume.
+    # Context accounting — drives compact_before_resume. input_tokens is the
+    # point-in-time occupancy (the last turn's input side, incl. cache), NOT the
+    # run's cumulative token spend; context_window is the model's window size.
+    # See run()'s last_turn_input_tokens and context_pct.
     input_tokens: int = 0
     context_window: int = 0
     # Termination diagnostics from the SDK ResultMessage. Recorded for every
@@ -84,6 +87,13 @@ def _extract_context(msg: ResultMessage) -> tuple[int, int]:
     Prefers model_usage (carries the per-model contextWindow, e.g. 1_000_000
     for the 1M opus), falling back to the flat usage dict. Returns (0, 0) when
     neither is present so callers treat context as unknown rather than zero.
+
+    IMPORTANT: the returned input_tokens is model_usage.inputTokens, which is the
+    SUM of every turn's input tokens across the whole run — NOT current context
+    occupancy. Do not divide it by context_window (that yields >100% on
+    multi-turn runs). It's used here only for the context_window value and as a
+    last-resort fallback; occupancy comes from the last turn's per-turn usage
+    (see run()'s last_turn_input_tokens). See context_pct.
     """
     model_usage = msg.model_usage or {}
     if model_usage:
@@ -233,6 +243,14 @@ class ClaudeProvider:
         num_turns = 0
         input_tokens = 0
         context_window = 0
+        # Point-in-time context occupancy: the input side of the LAST turn's
+        # usage (input + both cache buckets — cached tokens still occupy the
+        # window). This is what context_pct must divide by the window, NOT the
+        # ResultMessage's model_usage.inputTokens, which is the SUM of every
+        # turn's input tokens across the whole agentic run (42 turns → 2M) and
+        # produces nonsense like "209% of a 1M window". Each AssistantMessage
+        # overwrites this, so after the loop it holds the final turn's value.
+        last_turn_input_tokens = 0
         subtype: str | None = None
         stop_reason: str | None = None
         api_error_status: int | None = None
@@ -241,18 +259,31 @@ class ClaudeProvider:
         async def _consume() -> None:
             nonlocal session_id, result_text, is_error, cost_usd
             nonlocal duration_ms, num_turns, input_tokens, context_window
+            nonlocal last_turn_input_tokens
             nonlocal subtype, stop_reason, api_error_status, errors
             async for msg in query(prompt=prompt, options=sdk_options):
                 self._transcript_write(_message_to_dict(msg))
                 if isinstance(msg, AssistantMessage):
                     self._log_assistant(msg, options.step_id)
+                    u = msg.usage or {}
+                    if u:
+                        last_turn_input_tokens = (
+                            int(u.get("input_tokens", 0))
+                            + int(u.get("cache_read_input_tokens", 0))
+                            + int(u.get("cache_creation_input_tokens", 0))
+                        )
                 elif isinstance(msg, ResultMessage):
                     session_id = msg.session_id
                     is_error = msg.is_error
                     cost_usd = msg.total_cost_usd
                     duration_ms = msg.duration_ms
                     num_turns = msg.num_turns
-                    input_tokens, context_window = _extract_context(msg)
+                    # Take the window size from model_usage (correct), but the
+                    # occupancy from the per-turn point value captured above —
+                    # fall back to _extract_context's cumulative value only if no
+                    # turn carried usage, so we're never worse than before.
+                    cumulative_tokens, context_window = _extract_context(msg)
+                    input_tokens = last_turn_input_tokens or cumulative_tokens
                     subtype = msg.subtype
                     stop_reason = msg.stop_reason
                     api_error_status = getattr(msg, "api_error_status", None)
