@@ -96,6 +96,15 @@ pip install -e .          # or: uv pip install -e .
 
 Requires Python ≥ 3.10, plus `claude-agent-sdk`, `click`, and `pyyaml`.
 
+## Configuration
+
+Hydra runs on the Claude Agent SDK, which drives the same `claude` CLI that Claude Code uses. **Its configuration is therefore whatever Claude Code already uses on your machine** — there is nothing Hydra-specific to set up:
+
+- **Authentication** — the same credentials Claude Code runs on (a logged-in session, or `ANTHROPIC_API_KEY`). If `claude` works in your terminal, Hydra works.
+- **Settings, MCP servers, model access** — inherited from your existing Claude Code / CLI configuration. A pipeline can additionally declare its own `mcp_servers`, which are passed straight through to the SDK.
+
+If you don't have it yet, install and authenticate the Claude CLI first (see the [Claude Code docs](https://docs.claude.com/en/docs/claude-code)), then point Hydra at a pipeline.
+
 ## Usage
 
 ```bash
