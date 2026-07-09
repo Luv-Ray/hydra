@@ -15,9 +15,14 @@ from pathlib import Path
 
 import pytest
 
-from hydra.executor import ExecutionEngine, ABNORMAL_RETRY_BUDGET
+from hydra.executor import (
+    ExecutionEngine,
+    ABNORMAL_RETRY_BUDGET,
+    _classify_outcome,
+)
 from hydra.errors import ExecutionError
 from hydra.loader import load_pipeline
+from hydra.models import StepDef
 from hydra.provider import StepResult, StepRunOptions
 
 
@@ -145,3 +150,20 @@ def test_genuine_reject_still_routes(tmp_path: Path):
     # The REJECT genuinely routed through revise and back to gate.
     assert "revise" in provider.calls
     assert provider.calls.count("gate") == 2
+
+
+def test_stream_error_text_surfaces_in_reason():
+    # A stream interruption arrives as is_error=True with the real error text in
+    # `errors` (put there by provider.run's mid-stream branch). The classify
+    # reason must carry that text, not just the misleading subtype "success".
+    step = StepDef(id="challenge_alternatives", prompt="x", output="review.md")
+    result = StepResult(
+        session_id="s",
+        output_text="",
+        is_error=True,
+        subtype="success",  # the misleading CLI subtype
+        errors=["API Error: 上游响应流中断，响应不完整: error decoding response body"],
+    )
+    outcome, reason = _classify_outcome(step, result)
+    assert outcome == "abnormal_fatal"  # contracted (has output:) + errored
+    assert "上游响应流中断" in reason

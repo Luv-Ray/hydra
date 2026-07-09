@@ -66,10 +66,17 @@ def _classify_outcome(step: StepDef, result: StepResult) -> tuple[str, str]:
         return "ok", ""
 
     if errored:
+        # Surface the CLI's actual error text (e.g. "上游响应流中断，响应不完整")
+        # when present — without it the reason carries only subtype, which for a
+        # stream interruption is the misleading "success". See provider.run's
+        # mid-stream except branch, which puts that text into result.errors.
+        detail = "; ".join(result.errors) if result.errors else ""
         reason = (
             f"errored (is_error={result.is_error}, subtype={result.subtype}, "
             f"api_error_status={result.api_error_status})"
         )
+        if detail:
+            reason = f"{reason}: {detail}"
     else:
         reason = "empty output (step was contracted to produce a body)"
 

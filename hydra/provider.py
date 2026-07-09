@@ -292,6 +292,46 @@ class ClaudeProvider:
                 api_error_status=api_error_status,
                 errors=errors,
             )
+        except Exception as exc:
+            # The CLI can emit a ResultMessage with is_error=True (e.g. an
+            # upstream stream interruption: "上游响应流中断，响应不完整") and
+            # then exit non-zero. The SDK turns that non-zero exit into a raise
+            # from inside `async for msg in query(...)` — so this except fires
+            # *after* _consume already captured the failing ResultMessage into
+            # the nonlocals above. If we let it propagate, run() never returns
+            # and the executor's abnormal-outcome retry/classification never
+            # runs — the whole pipeline crashes on a transient blip. Convert it
+            # to a failed StepResult, exactly like the timeout branch, so retry
+            # handling treats it as the transient error it is.
+            #
+            # asyncio.CancelledError is a BaseException on 3.8+, so `except
+            # Exception` already lets genuine cancellation propagate.
+            self._log(f"step '{options.step_id}' errored mid-stream: {exc}")
+            self._transcript_write({"kind": "error", "error": str(exc)})
+            self._transcript_close()
+            # Prefer the structured error text the CLI already reported (in
+            # `errors`); fall back to the raised exception message. This is what
+            # surfaces in the step_abnormal event / ExecutionError reason, so
+            # the operator sees "上游响应流中断" rather than a bare "success"
+            # (the SDK's ProcessError-replacement text falls back to subtype
+            # when errors is empty, which is misleading on its own).
+            err_list = errors if errors else [str(exc)]
+            return StepResult(
+                session_id=session_id,
+                output_text=result_text or "",
+                is_error=True,
+                cost_usd=cost_usd,
+                duration_ms=duration_ms,
+                num_turns=num_turns,
+                input_tokens=input_tokens,
+                context_window=context_window,
+                # Distinguish a mid-stream transport failure from a clean model
+                # reply when the CLI never gave us a subtype of its own.
+                subtype=subtype or "stream_error",
+                stop_reason=stop_reason,
+                api_error_status=api_error_status,
+                errors=err_list,
+            )
 
         self._transcript_close()
 
