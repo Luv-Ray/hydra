@@ -6,3 +6,7 @@ dist/
 *.pyc
 .pytest_cache/
 .hydra/
+
+# uv 锁文件：本仓库靠 pyproject.toml 的版本范围工作，不锁 uv 专属格式
+# （非 uv 用户读不了）。要走 uv-only 的可复现路线时再单独提交并在 README 说明。
+uv.lock
