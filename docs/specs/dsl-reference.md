@@ -35,6 +35,12 @@ mcp_servers:                   # 可选,MCP server 配置,原样传给 Agent SDK
   my-server:
     command: "..."
 
+system_prompt: |               # 可选,追加到引擎内置 system prompt 之后,作用于每个 step
+  你是资深 Android 系统工程师,全程遵守证据分级。
+
+user_preamble: |              # 可选,前置到每个 step 的 user prompt 之前
+  产出文件写到当前工作目录:用相对路径,不要加绝对路径前缀。
+
 steps:
   - ...
 ```
@@ -47,6 +53,8 @@ steps:
 | `defaults` | 否 | step 级属性默认值,step 同名字段**覆盖**(非合并) |
 | `workdir` | 否 | 工作目录,支持 `{{ inputs.xxx }}` 模板;相对路径相对于**当前工作目录**解析 |
 | `mcp_servers` | 否 | MCP server 映射,整体透传给 provider |
+| `system_prompt` | 否 | 追加到引擎内置 system prompt 之后,作用于每个 step;支持 `{{ inputs.xxx }}` 模板 |
+| `user_preamble` | 否 | 前置到每个 step 的 user prompt 之前(先于 inject 内容);支持 `{{ inputs.xxx }}` 模板 |
 | `steps` | 是 | step 列表,至少一个 |
 
 ### inputs 定义
@@ -66,6 +74,19 @@ inputs:
 step 未显式设置的字段,取 defaults 的值;显式写了就覆盖。**没有合并、没有追加。** 可作为默认的字段:`model` / `retry` / `timeout` / `max_iterations` / `allowed_tools`。
 
 > 注意:`defaults` 没有 `provider` 字段。当前实现固定使用 `ClaudeProvider`。
+
+### system_prompt vs user_preamble
+
+两者都是 pipeline 级、作用于**每个 step**,区别在于注入到哪条提示、以什么方式:
+
+| | 注入位置 | 方式 | 适合放什么 |
+|---|---|---|---|
+| `system_prompt` | 引擎内置 system prompt 之后 | 追加(带外下发,不在 step 指令里) | 贯穿整轮的角色/纪律,如"你是资深 X 工程师,遵守证据分级" |
+| `user_preamble` | 每个 step 的 user prompt 最前面(先于 inject 内容) | 前置 | 每步都要复述的操作性上下文,如产出路径约定、日志目录位置 |
+
+- 命名对齐 LLM 的 system/user 二分:`system` 走系统提示、`user` 走用户提示;后缀 `prompt`(整段系统提示)与 `preamble`(前置片段)对应各自的注入方式。
+- 两者都在加载时做 `{{ inputs.xxx }}` 模板展开,和 step `prompt` 一致。
+- 都省略时,step 只收到自己的 `prompt`(加内置 system prompt),行为与旧 pipeline 完全一致。
 
 ---
 

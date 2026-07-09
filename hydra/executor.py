@@ -499,7 +499,7 @@ class ExecutionEngine:
             retry_feedback=retry_feedback,
             output_path=step.output,
             allow_missing=allow_missing,
-            preamble=self.pipeline.prompt_preamble,
+            preamble=self.pipeline.user_preamble,
         )
 
     def _build_run_options(

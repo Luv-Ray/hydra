@@ -1,4 +1,4 @@
-"""Pipeline-wide system_prompt (appended) and prompt_preamble (prepended)."""
+"""Pipeline-wide system_prompt (appended) and user_preamble (prepended)."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ inputs:
 
 system_prompt: |
   你是一位资深 {{ inputs.who }}，全程遵守证据分级。
-prompt_preamble: |
+user_preamble: |
   日志在 logs/，仓库看 repo-index.md。
 
 steps:
@@ -91,7 +91,7 @@ def test_absent_fields_default_to_none(tmp_path: Path):
     p.write_text(content)
     pipeline = load_pipeline(p)
     assert pipeline.system_prompt is None
-    assert pipeline.prompt_preamble is None
+    assert pipeline.user_preamble is None
 
     provider = CapturingProvider()
     pipeline.workdir = str(tmp_path)

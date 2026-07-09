@@ -160,8 +160,8 @@ class Pipeline:
     mcp_servers: dict[str, Any] = field(default_factory=dict)
     # Applied to every step. system_prompt is appended to the engine's built-in
     # automation system prompt (role/discipline that spans the whole run, sent
-    # out-of-band from the step instruction). prompt_preamble is prepended to
+    # out-of-band from the step instruction). user_preamble is prepended to
     # each step's user prompt (operational context repeated per step). See loader
     # / executor / provider for how each threads through.
     system_prompt: str | None = None
-    prompt_preamble: str | None = None
+    user_preamble: str | None = None

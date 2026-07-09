@@ -59,9 +59,9 @@ def load_pipeline(
     system_prompt = data.get("system_prompt")
     if system_prompt:
         system_prompt = expand_template(system_prompt, resolved_inputs)
-    prompt_preamble = data.get("prompt_preamble")
-    if prompt_preamble:
-        prompt_preamble = expand_template(prompt_preamble, resolved_inputs)
+    user_preamble = data.get("user_preamble")
+    if user_preamble:
+        user_preamble = expand_template(user_preamble, resolved_inputs)
 
     return Pipeline(
         name=data.get("name", path.stem),
@@ -72,7 +72,7 @@ def load_pipeline(
         workdir=workdir,
         mcp_servers=data.get("mcp_servers", {}),
         system_prompt=system_prompt,
-        prompt_preamble=prompt_preamble,
+        user_preamble=user_preamble,
     )
 
 
