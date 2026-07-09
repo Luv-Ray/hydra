@@ -90,10 +90,10 @@ def _output_contract(output_path: str) -> str:
     """
     return (
         f"[Output contract] Your reply to this message is saved verbatim as the "
-        f"file `{output_path}` and read by later steps in this pipeline as input. "
-        "It is the file's content, not a message to a reader. Output exactly what "
-        "that file should contain and nothing else — no preamble, framing, or "
-        "commentary around it."
+        f"file `{output_path}` and read by later steps as input — the framework "
+        "writes it, you do not. Your reply is the file's content, not a message "
+        "to a reader: output exactly what the file should contain, with no "
+        "preamble, framing, or commentary."
     )
 
 
