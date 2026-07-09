@@ -7,6 +7,8 @@ dist/
 .pytest_cache/
 .hydra/
 
-# uv 锁文件：本仓库靠 pyproject.toml 的版本范围工作，不锁 uv 专属格式
-# （非 uv 用户读不了）。要走 uv-only 的可复现路线时再单独提交并在 README 说明。
+# uv lock file: this repo works from pyproject.toml version ranges and does not
+# pin the uv-only lock format (non-uv users can't consume it). If we later
+# commit to a uv-only reproducible setup, track it deliberately and note it in
+# the README.
 uv.lock
