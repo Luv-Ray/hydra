@@ -78,6 +78,9 @@ class StepResult:
         return 100.0 * self.input_tokens / self.context_window
 
 
+# The built-in tools a step gets when it declares no allowed_tools of its own.
+# This is the *visibility* set (SDK `tools=`), not a permission whitelist — see
+# run() for why the distinction matters.
 DEFAULT_TOOLS = ["Read", "Edit", "Write", "Bash", "Glob", "Grep"]
 
 
@@ -211,8 +214,19 @@ class ClaudeProvider:
         system_prompt = SYSTEM_PROMPT
         if options.extra_system_prompt:
             system_prompt = f"{SYSTEM_PROMPT}\n\n{options.extra_system_prompt}"
+        # A step's allowed_tools must restrict what the model can *call*, so it
+        # maps to the SDK's `tools` (the visibility set), NOT the SDK's
+        # `allowed_tools`. Those are different fields: SDK `allowed_tools` is a
+        # permission whitelist ("run these without prompting"), and under
+        # permission_mode="bypassPermissions" every tool is already auto-allowed,
+        # so passing our restriction there is a silent no-op — the model still
+        # sees the full default toolset (Bash/Write/Edit/Task/...). Feeding it to
+        # `tools` is what actually removes the others from the model's context.
+        # (MCP tools come from the CLI's setting_sources and are unaffected by
+        # `tools`; this bounds only built-ins, which is where step misuse lives.)
+        tools = options.allowed_tools or DEFAULT_TOOLS
         sdk_options = ClaudeAgentOptions(
-            allowed_tools=options.allowed_tools or DEFAULT_TOOLS,
+            tools=tools,
             permission_mode="bypassPermissions",
             system_prompt=system_prompt,
         )
