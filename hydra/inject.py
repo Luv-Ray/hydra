@@ -73,27 +73,30 @@ def build_prompt(
         full = prompt
 
     if output_path:
-        full = f"{full}\n\n---\n\n{_output_contract(output_path)}"
+        full = f"{full}\n\n---\n\n{_output_contract()}"
 
     return full
 
 
-def _output_contract(output_path: str) -> str:
+def _output_contract() -> str:
     """Note appended when a step captures its reply body into a file.
 
-    Root cause this addresses: by default a model frames its reply as a message
-    to a human — adding preambles, progress recaps, and sign-offs. But here the
-    reply is saved verbatim as a file and read by later steps; no human reads it
-    as a message. This states the document-production frame once, at the
-    framework level, so the model emits the artifact itself rather than prose
-    about producing it. Kept general on purpose — not a list of things to avoid.
+    Addresses two failure modes:
+    1. Framing — models default to writing a reply *to a human* (preamble,
+       recap, sign-off), but the reply is saved verbatim as an artifact.
+    2. Self-write — a model that knows the target filename tends to Write /
+       shell-redirect the artifact there, then reply with a status line
+       ("file is complete, 271 lines"); the framework captures that status
+       line and overwrites the good on-disk file. So the contract omits the
+       filename and says explicitly not to write the file itself.
     """
     return (
-        f"[Output contract] Your reply to this message is saved verbatim as the "
-        f"file `{output_path}` and read by later steps as input — the framework "
-        "writes it, you do not. Your reply is the file's content, not a message "
-        "to a reader: output exactly what the file should contain, with no "
-        "preamble, framing, or commentary."
+        "[Output contract] The framework saves your reply body verbatim as a "
+        "file and feeds it to later steps; no human reads it as a message. So "
+        "your reply must BE the file's content — not a Write/redirect to disk "
+        "(that copy is discarded and overwritten by your reply), and not a "
+        "status note about the work (that note becomes the file). Output exactly "
+        "what the file should contain, with no preamble or commentary."
     )
 
 

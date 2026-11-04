@@ -20,14 +20,18 @@ def test_no_output_no_contract():
     assert "Output contract" not in out
 
 
-def test_output_appends_contract_with_path():
+def test_output_appends_contract_without_naming_file():
     out = build_prompt(
         prompt="Write the report", inject_paths=[], output_path="final-report.md"
     )
     assert out.startswith("Write the report")
     assert "Output contract" in out
-    # The note names the exact target file so the model knows the destination.
-    assert out.count("final-report.md") >= 1
+    # The contract must NOT name the destination file: naming it made models
+    # treat the filename as a write target, Write/redirect the artifact there,
+    # then reply with a status line that overwrote the good file.
+    assert "final-report.md" not in out
+    # It must tell the model not to write the file itself.
+    assert "Write" in out
     # Contract comes after the step prompt, separated by a rule.
     assert out.index("Write the report") < out.index("Output contract")
 
