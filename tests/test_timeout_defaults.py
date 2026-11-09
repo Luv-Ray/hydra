@@ -26,7 +26,7 @@ def test_no_timeout_anywhere_is_unlimited():
     pl = _load(
         """
         name: t
-        version: 1
+        version: 2
         steps:
           - id: a
             prompt: go
@@ -39,7 +39,7 @@ def test_defaults_timeout_inherited():
     pl = _load(
         """
         name: t
-        version: 1
+        version: 2
         defaults:
           timeout: 600
         steps:
@@ -54,7 +54,7 @@ def test_step_timeout_overrides_default():
     pl = _load(
         """
         name: t
-        version: 1
+        version: 2
         defaults:
           timeout: 600
         steps:

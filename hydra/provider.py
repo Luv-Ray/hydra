@@ -5,7 +5,7 @@ from __future__ import annotations
 import sys
 import json
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Protocol, TextIO
@@ -29,6 +29,9 @@ class StepRunOptions:
     timeout: int | None = None
     cwd: str | None = None
     resume_session_id: str | None = None
+    # With resume: continue in a copy of the session (SDK fork_session) instead
+    # of appending to it in place.
+    fork_session: bool = False
     mcp_servers: dict[str, Any] | None = None
     # Pipeline-wide system_prompt, appended to the built-in automation prompt.
     extra_system_prompt: str | None = None
@@ -47,7 +50,8 @@ class StepResult:
     # as a hard error rather than fabricating a fake id that the SDK can't find.
     session_id: str | None
     output_text: str
-    check_output: str | None = None
+    # Reply to the verdict follow-up (verdict.prompt), when the step has one.
+    verdict_reply: str | None = None
     is_error: bool = False
     cost_usd: float | None = None
     duration_ms: int = 0
@@ -62,7 +66,7 @@ class StepResult:
     # step (not just verbose runs) so an empty/abnormal output can be told apart
     # from a genuine model reply after the fact — e.g. subtype "error_max_turns"
     # or a non-None api_error_status (429/500/529) means the step never produced
-    # a verdict and must not be routed as a REJECT. See executor._classify_outcome.
+    # a verdict. See executor._abnormal_reason.
     subtype: str | None = None
     stop_reason: str | None = None
     api_error_status: int | None = None
@@ -184,10 +188,14 @@ SYSTEM_PROMPT = (
 class Provider(Protocol):
     async def run(self, prompt: str, options: StepRunOptions) -> StepResult: ...
 
-    async def check(self, session_id: str, prompt: str, cwd: str | None = None) -> str: ...
+    # `options` are those of the step that built the session (same tools,
+    # system prompt, model, cwd), so the follow-up stays on its cached prefix.
+    async def follow_up(
+        self, session_id: str, prompt: str, options: StepRunOptions
+    ) -> str: ...
 
     async def compact(
-        self, session_id: str, model: str | None = None, cwd: str | None = None
+        self, session_id: str, options: StepRunOptions
     ) -> tuple[int, int]: ...
 
 
@@ -210,7 +218,16 @@ class ClaudeProvider:
             self._trace.close()
         self._trace = path.open("a") if path else None
 
-    async def run(self, prompt: str, options: StepRunOptions) -> StepResult:
+    @staticmethod
+    def _sdk_options(options: StepRunOptions) -> ClaudeAgentOptions:
+        """The one place StepRunOptions becomes ClaudeAgentOptions.
+
+        run(), check() and compact() all build from this, so a follow-up or a
+        /compact on a session uses the same tools, system prompt and model the
+        session was built with. Prompt caching keys on that prefix (tools →
+        system → messages); a follow-up with a different toolset or system
+        prompt would re-read the whole transcript uncached.
+        """
         system_prompt = SYSTEM_PROMPT
         if options.extra_system_prompt:
             system_prompt = f"{SYSTEM_PROMPT}\n\n{options.extra_system_prompt}"
@@ -239,9 +256,13 @@ class ClaudeProvider:
             sdk_options.cwd = options.cwd
         if options.resume_session_id:
             sdk_options.resume = options.resume_session_id
+            sdk_options.fork_session = options.fork_session
         if options.mcp_servers:
             sdk_options.mcp_servers = options.mcp_servers
+        return sdk_options
 
+    async def run(self, prompt: str, options: StepRunOptions) -> StepResult:
+        sdk_options = self._sdk_options(options)
         self._log_prompt(prompt, options)
 
         # Full untruncated transcript for this run (see StepRunOptions). Record
@@ -398,33 +419,35 @@ class ClaudeProvider:
             errors=errors,
         )
 
-    async def check(self, session_id: str, prompt: str, cwd: str | None = None) -> str:
-        """Send a follow-up check prompt in the same session.
+    @staticmethod
+    def _session_options(session_id: str, options: StepRunOptions) -> ClaudeAgentOptions:
+        """Options for one more turn appended to `session_id` itself (no fork).
 
-        cwd must match the working directory the session was created under —
-        the CLI stores/looks up sessions per project dir, so resuming from a
-        different cwd fails with "No conversation found".
+        cwd must match the directory the session was created under — the CLI
+        keys sessions by project dir, so a different cwd fails with "No
+        conversation found". Carrying the building step's options keeps it so.
         """
-        self._log(f"  check: {prompt[:100]}")
-        sdk_options = ClaudeAgentOptions(
-            resume=session_id,
-            permission_mode="bypassPermissions",
-            max_turns=1,
+        sdk_options = ClaudeProvider._sdk_options(
+            replace(options, resume_session_id=session_id, fork_session=False)
         )
-        if cwd:
-            sdk_options.cwd = cwd
+        sdk_options.max_turns = 1
+        return sdk_options
 
+    async def follow_up(
+        self, session_id: str, prompt: str, options: StepRunOptions
+    ) -> str:
+        """Ask one more question in the same session; return the reply text."""
+        self._log(f"  [{options.step_id}] follow-up: {prompt[:100]}")
         result_text = ""
-        async for msg in query(prompt=prompt, options=sdk_options):
+        async for msg in query(prompt=prompt, options=self._session_options(session_id, options)):
             if isinstance(msg, ResultMessage):
                 if msg.result:
                     result_text = msg.result
-                self._log(f"  check result: {result_text[:100]}")
-
+                self._log(f"  [{options.step_id}] follow-up reply: {result_text[:100]}")
         return result_text
 
     async def compact(
-        self, session_id: str, model: str | None = None, cwd: str | None = None
+        self, session_id: str, options: StepRunOptions
     ) -> tuple[int, int]:
         """Compact a session in place, the way `/compact` does in the CLI.
 
@@ -433,31 +456,17 @@ class ClaudeProvider:
         disconnects. The compaction persists to the session on disk, so the
         next step that resumes this id inherits the lighter transcript.
 
-        `model` must match the model the resumed session was built on. `/compact`
-        feeds the whole transcript back to the model to summarize it; running it
-        on a different model than the one that holds the cached context is a full
-        cache miss (and re-reads the entire transcript). Callers pass the resume
-        target's model so compaction stays on the same model as the step it
-        precedes.
-
-        `cwd` must match the working directory the session was created under.
-        The CLI stores sessions per project directory (keyed by cwd), so
-        resuming from a different cwd fails with "No conversation found".
+        `options` are the resume *target's* run options. `/compact` feeds the
+        whole transcript back through the model, so it must run on the model,
+        tools and system prompt the session was built with — any mismatch is a
+        full cache miss over the entire transcript. cwd must match too (see
+        _session_options).
 
         Returns (input_tokens, context_window) after compaction — measured via
         get_context_usage() so the caller can update its cached size and log
         the reduction. Returns (0, 0) if the size could not be read.
         """
-        options = ClaudeAgentOptions(
-            resume=session_id,
-            permission_mode="bypassPermissions",
-            max_turns=1,
-        )
-        if model:
-            options.model = model
-        if cwd:
-            options.cwd = cwd
-        client = ClaudeSDKClient(options=options)
+        client = ClaudeSDKClient(options=self._session_options(session_id, options))
         await client.connect()
         try:
             await client.query("/compact")
@@ -527,7 +536,11 @@ class ClaudeProvider:
         joined by '\\n\\n---\\n\\n'. The real instruction is the last segment;
         showing it (instead of prompt[:120]) makes each step's log distinct.
         """
-        instruction = prompt.rsplit("\n\n---\n\n", 1)[-1].strip()
+        segments = [
+            s for s in prompt.split("\n\n---\n\n")
+            if not s.startswith(("[Output contract]", "[Verdict contract]"))
+        ]
+        instruction = (segments[-1] if segments else prompt).strip()
         preview = instruction[:160].replace("\n", " ")
         ellipsis = "..." if len(instruction) > 160 else ""
         self._log(f"  [{options.step_id}] instruction: {preview}{ellipsis}")

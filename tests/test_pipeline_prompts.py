@@ -20,13 +20,11 @@ class CapturingProvider:
         self.seen.append((options.step_id, options.extra_system_prompt, prompt))
         return StepResult(session_id=f"sess-{options.step_id}", output_text="ok")
 
-    async def check(self, session_id, prompt, cwd=None):
-        return "yes"
 
 
 PIPELINE = """\
 name: prompt-fields
-version: 1
+version: 2
 
 inputs:
   who:
@@ -55,7 +53,7 @@ def test_both_prompt_fields_applied_to_every_step(tmp_path: Path):
     pipeline = load_pipeline(p)
     pipeline.workdir = str(tmp_path)
     provider = CapturingProvider()
-    engine = ExecutionEngine(pipeline=pipeline, inputs={}, provider=provider)
+    engine = ExecutionEngine(pipeline=pipeline, provider=provider)
     assert asyncio.run(engine.run()) == "success"
 
     assert len(provider.seen) == 2
@@ -69,22 +67,21 @@ def test_both_prompt_fields_applied_to_every_step(tmp_path: Path):
 
 def test_system_prompt_appended_not_replacing_builtin(tmp_path: Path):
     # The engine's automation prompt must survive; the field appends to it.
+    from hydra.provider import ClaudeProvider
+
     p = tmp_path / "pipeline.yaml"
     p.write_text(PIPELINE)
     pipeline = load_pipeline(p)
-
-    # loader stores the expanded field; provider concatenation is unit-checked here
-    from hydra.provider import ClaudeProvider  # noqa: F401
-
-    assert pipeline.system_prompt is not None
-    combined = f"{SYSTEM_PROMPT}\n\n{pipeline.system_prompt}"
-    assert combined.startswith(SYSTEM_PROMPT)
-    assert "证据分级" in combined
+    sdk = ClaudeProvider._sdk_options(
+        StepRunOptions(step_id="s", extra_system_prompt=pipeline.system_prompt)
+    )
+    assert sdk.system_prompt.startswith(SYSTEM_PROMPT)
+    assert "证据分级" in sdk.system_prompt
 
 
 def test_absent_fields_default_to_none(tmp_path: Path):
     content = (
-        "name: bare\nversion: 1\nsteps:\n"
+        "name: bare\nversion: 2\nsteps:\n"
         "  - id: only\n    prompt: \"x\"\n"
     )
     p = tmp_path / "pipeline.yaml"
@@ -95,7 +92,7 @@ def test_absent_fields_default_to_none(tmp_path: Path):
 
     provider = CapturingProvider()
     pipeline.workdir = str(tmp_path)
-    engine = ExecutionEngine(pipeline=pipeline, inputs={}, provider=provider)
+    engine = ExecutionEngine(pipeline=pipeline, provider=provider)
     assert asyncio.run(engine.run()) == "success"
     step_id, sys_prompt, user_prompt = provider.seen[0]
     assert sys_prompt is None

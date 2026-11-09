@@ -26,43 +26,41 @@
 YAML pipeline
      │
      ▼
-  loader.py     ← 解析 + 模板展开 + defaults 合并
+  loader.py + models.py ← 严格解析(未知键/类型报错)+ inputs + defaults + 模板
      │
      ▼
-  validate.py   ← 静态校验
+  validate.py   ← 引用、表达式、loop 结构、环、并发 resume 安全
      │
      ▼
-  dag.py        ← 依赖推导 + 拓扑排序
+  dag.py        ← 依赖推导 → 调度图(节点 = step 或整个 loop)
      │
      ▼
-  executor.py   ← DAG 执行 + routes + retry + goto
+  executor.py   ← 数据流调度 + when + loop 轮次 + verdict + 异常重试
      │
-     ├── provider.py    ← Claude Agent SDK 调用
-     ├── inject.py      ← 文件注入
+     ├── provider.py    ← Claude Agent SDK 调用(run / verdict 追问 / compact)
+     ├── inject.py      ← 文件注入 + 输出契约 / verdict 契约
      ├── events.py      ← 结构化事件流(控制流可观测性)
-     └── persistence.py ← .hydra/runs/ 持久化
+     └── persistence.py ← .hydra/runs/ 持久化与接续
 ```
 
 ## 核心概念
 
 ### 上下文传递：文件优先
 
-- `output: path` — step 结果写入文件
+- `output: path` — step 回复正文写入文件
 - `inject: [paths]` — 读文件内容注入 prompt
-- `resume: step_id` — 1:1 session 接续（继承完整对话历史）
+- `resume: step_id` — 接续某 step 的 session(默认追加,`fork: true` 在副本上继续)
 
 ### 执行模型
 
-1. 解析 YAML → Pipeline 对象
-2. 求值 `when` 条件，标记跳过的 step
-3. 构建 DAG（`trigger: dag` 的 step）
-4. 按拓扑层并发执行
-5. 每步执行后：check → routes → 可能 goto（前跳或回跳）
-6. `trigger: route` 的 step 不在 DAG 中，仅通过 goto 触达
+1. 解析 YAML → Pipeline 对象,校验
+2. 推导依赖,把每个 loop 收成一个节点,得到无环调度图
+3. 数据流调度:节点的依赖全部完成即启动
+4. step 启动时求值 `when`,为假则跳过
+5. step 跑完读出 `verdict`(如有),供下游 `when` 与 loop 的 `until` 使用
+6. loop 节点按轮运行 body → 判定 until → fix,直到成立或轮次用尽
 
-### 条件路由 & 循环
+### 分支与循环
 
-- `routes` 基于 success/failure 跳转
-- goto 回跳形成循环（每次全新 session + 文件为最新内容）
-- `max_iterations` 防止无限循环
-- `retry` + `retry_inject` 做带反馈的重试
+- 分支 = `when` 读上游 verdict;重做 = 声明式 `loops`。没有 goto。
+- verdict 是答案;报错、空回复、读不出 verdict 是"没有答案",按 `retry` 重试后失败,不会被当成 REJECT。

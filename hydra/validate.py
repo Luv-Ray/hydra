@@ -1,256 +1,223 @@
-"""Static validation for Hydra pipeline definitions."""
+"""Static validation for Hydra pipeline definitions (cross-references, graph).
+
+Key/type errors are caught earlier by the strict parsers in models.py; this
+module checks what needs the whole pipeline in view. Hard errors raise
+ValidationError; soft issues are returned as warnings.
+"""
 
 from __future__ import annotations
 
-import glob as globmod
-import sys
+import re
 
+from .dag import Schedule, _closure, build_schedule, is_glob, topo_order
 from .errors import TemplateError, ValidationError
-from .expr import eval_when
+from .expr import expr_refs, parse_expr, verdict_literals
 from .models import Pipeline, StepDef
+
+# Step/loop ids must be identifiers so `steps.ID.verdict` parses as an expression.
+_ID_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def validate_pipeline(pipeline: Pipeline) -> list[str]:
-    """Run all validation checks. Raises ValidationError on hard errors.
-
-    Returns a list of warnings (non-fatal).
-    """
+    """Run all checks. Raises ValidationError on hard errors; returns warnings."""
     warnings: list[str] = []
-    step_ids = {s.id for s in pipeline.steps}
-    step_map = {s.id: s for s in pipeline.steps}
-    output_map = {s.output: s.id for s in pipeline.steps if s.output}
+    steps = {s.id: s for s in pipeline.steps}
 
-    _check_id_uniqueness(pipeline.steps)
-    _check_references(pipeline.steps, step_ids)
-    _check_resume_uniqueness(pipeline.steps)
-    _check_route_targets(pipeline.steps, step_ids)
-    _check_trigger_route_reachable(pipeline.steps, step_ids, warnings)
-    _check_loop_protection(pipeline.steps, step_map)
-    _check_loop_body(pipeline.steps, step_ids, step_map)
-    _check_when_syntax(pipeline.steps)
-    _check_check_fields(pipeline.steps)
-    _check_glob_without_after(pipeline.steps, output_map, warnings)
+    _check_ids(pipeline)
+    for s in pipeline.steps:
+        _check_step(s, steps, pipeline)
+    _check_outputs_unique(pipeline.steps)
+    loop_of = _check_loops(pipeline, steps)
 
+    schedule = build_schedule(pipeline)
+    schedule.order()  # raises on a cycle between nodes
+    for loop_id, deps in schedule.body_deps.items():
+        topo_order(deps, f"loop '{loop_id}' body")
+    _check_concurrent_resume(pipeline, schedule, loop_of)
+
+    _warn_unused_verdicts(pipeline, warnings)
+    _warn_globs_without_after(pipeline.steps, warnings)
     return warnings
 
 
-def _check_id_uniqueness(steps: list[StepDef]) -> None:
+def _check_ids(pipeline: Pipeline) -> None:
     seen: set[str] = set()
-    for step in steps:
-        if step.id in seen:
-            raise ValidationError(f"Duplicate step id: '{step.id}'")
-        seen.add(step.id)
-
-
-def _check_references(steps: list[StepDef], step_ids: set[str]) -> None:
-    for step in steps:
-        if step.resume and step.resume not in step_ids:
-            raise ValidationError(
-                f"Step '{step.id}': resume references unknown step '{step.resume}'"
-            )
-        for dep in step.after:
-            if dep not in step_ids:
+    for kind, ids in (("step", [s.id for s in pipeline.steps]),
+                      ("loop", [lp.id for lp in pipeline.loops])):
+        for i in ids:
+            if not _ID_RE.match(i):
                 raise ValidationError(
-                    f"Step '{step.id}': after references unknown step '{dep}'"
+                    f"Invalid {kind} id '{i}': use letters, digits and underscores "
+                    f"(it must be referable as steps.{i}.verdict)"
                 )
+            if i in seen:
+                raise ValidationError(f"Duplicate id: '{i}' (step and loop ids share one namespace)")
+            seen.add(i)
 
 
-def _check_resume_uniqueness(steps: list[StepDef]) -> None:
-    """A session may be resumed by many route steps but at most one DAG step.
-
-    resume appends to the target's on-disk session (it does not fork a copy), so
-    two resumers that run concurrently would corrupt each other's transcript.
-    DAG steps in the same topological layer run in parallel, hence the 1-max on
-    non-route resumers. trigger:route steps are reached only via explicit goto,
-    one at a time, so any number of them may resume the same target serially
-    (e.g. mini-revise and revise both resuming analyze on different reject paths).
-    """
-    dag_resumers: dict[str, list[str]] = {}
-    for step in steps:
-        if step.resume and step.trigger != "route":
-            dag_resumers.setdefault(step.resume, []).append(step.id)
-    for target, users in dag_resumers.items():
-        if len(users) > 1:
+def _check_expr(
+    expr: str, where: str, pipeline: Pipeline, steps: dict[str, StepDef]
+) -> set[str]:
+    """Parse an expression and check every reference. Returns referenced step ids."""
+    try:
+        node = parse_expr(expr)
+    except TemplateError as e:
+        raise ValidationError(f"{where}: {e}") from e
+    input_refs, step_refs = expr_refs(node)
+    for name in sorted(input_refs - set(pipeline.inputs)):
+        raise ValidationError(f"{where}: inputs.{name} is not a declared input")
+    for sid in sorted(step_refs):
+        if sid not in steps:
+            raise ValidationError(f"{where}: steps.{sid} is not a step")
+        if steps[sid].verdict is None:
+            raise ValidationError(f"{where}: steps.{sid}.verdict — step '{sid}' declares no verdict")
+    for sid, lit in verdict_literals(node):
+        allowed = steps[sid].verdict.values  # type: ignore[union-attr]
+        if lit is not None and str(lit) not in allowed:
             raise ValidationError(
-                f"Multiple non-route steps resume '{target}': {users}. "
-                f"Concurrent resumers would corrupt the shared session — at most "
-                f"one DAG step may resume a target (route steps are unlimited)."
+                f"{where}: compares steps.{sid}.verdict to {lit!r}, which is not one "
+                f"of its values {allowed}"
             )
+    return step_refs
 
 
-def _check_route_targets(steps: list[StepDef], step_ids: set[str]) -> None:
-    specials = {"$end", "$fail"}
-    for step in steps:
-        if not step.routes:
+def _check_step(s: StepDef, steps: dict[str, StepDef], pipeline: Pipeline) -> None:
+    where = f"step '{s.id}'"
+    for dep in s.after:
+        if dep not in steps:
+            raise ValidationError(f"{where}: after references unknown step '{dep}'")
+    if s.resume is not None:
+        if s.resume not in steps:
+            raise ValidationError(f"{where}: resume references unknown step '{s.resume}'")
+        if s.resume == s.id:
+            raise ValidationError(f"{where}: cannot resume itself")
+    else:
+        if s.fork:
+            raise ValidationError(f"{where}: 'fork' requires 'resume'")
+        if s.compact_before_resume is not None:
+            raise ValidationError(f"{where}: 'compact_before_resume' requires 'resume'")
+    if s.compact_before_resume is not None and not 0 < s.compact_before_resume <= 100:
+        raise ValidationError(f"{where}: compact_before_resume must be in 1..100")
+    for key in ("timeout", "max_turns"):
+        v = getattr(s, key)
+        if v is not None and v <= 0:
+            raise ValidationError(f"{where}: {key} must be > 0")
+    if s.retry is not None and s.retry < 0:
+        raise ValidationError(f"{where}: retry must be >= 0")
+    if s.when:
+        _check_expr(s.when, f"{where} when", pipeline, steps)
+
+
+def _check_outputs_unique(steps: list[StepDef]) -> None:
+    owner: dict[str, str] = {}
+    for s in steps:
+        if not s.output:
             continue
-        for route in step.routes:
-            targets = route.goto if isinstance(route.goto, list) else [route.goto]
-            for t in targets:
-                if t not in step_ids and t not in specials:
+        if s.output in owner:
+            raise ValidationError(
+                f"Steps '{owner[s.output]}' and '{s.id}' both write output '{s.output}'"
+            )
+        owner[s.output] = s.id
+
+
+def _check_loops(pipeline: Pipeline, steps: dict[str, StepDef]) -> dict[str, str]:
+    """Check loop structure. Returns step id → id of the loop it belongs to."""
+    loop_of: dict[str, str] = {}
+    for loop in pipeline.loops:
+        where = f"loop '{loop.id}'"
+        if not loop.body:
+            raise ValidationError(f"{where}: body must list at least one step")
+        if len(set(loop.body)) != len(loop.body):
+            raise ValidationError(f"{where}: body lists a step twice")
+        if loop.fix in loop.body:
+            raise ValidationError(f"{where}: fix step '{loop.fix}' must not also be in body")
+        members = list(loop.body) + ([loop.fix] if loop.fix else [])
+        for sid in members:
+            if sid not in steps:
+                raise ValidationError(f"{where}: references unknown step '{sid}'")
+            if sid in loop_of:
+                raise ValidationError(
+                    f"Step '{sid}' belongs to both loop '{loop_of[sid]}' and '{loop.id}'"
+                )
+            loop_of[sid] = loop.id
+        for sid in loop.body:
+            if loop.fix and steps[sid].resume == loop.fix:
+                raise ValidationError(
+                    f"{where}: body step '{sid}' resumes the fix step '{loop.fix}', "
+                    f"which has no session in round 1"
+                )
+        refs = _check_expr(loop.until, f"{where} until", pipeline, steps)
+        outside = sorted(refs - set(loop.body))
+        if outside:
+            raise ValidationError(
+                f"{where}: until may only read verdicts of body steps; {outside} "
+                f"are not in body"
+            )
+        if not refs:
+            raise ValidationError(
+                f"{where}: until must read the verdict of a body step "
+                f"(otherwise no round can change its outcome)"
+            )
+    return loop_of
+
+
+def _check_concurrent_resume(
+    pipeline: Pipeline, schedule: Schedule, loop_of: dict[str, str]
+) -> None:
+    """Resumers of one target that may run at the same time must all fork.
+
+    A non-fork resume appends to the target's session file in place; two of
+    them running concurrently would interleave writes into one transcript.
+    Forked resumers each get their own copy, so any number may run in parallel.
+    """
+    ancestors = schedule.ancestors()
+    loops = {lp.id: lp for lp in pipeline.loops}
+    body_anc = {lid: _closure(d) for lid, d in schedule.body_deps.items()}
+
+    def may_overlap(a: str, b: str) -> bool:
+        na, nb = schedule.node_of[a], schedule.node_of[b]
+        if na != nb:
+            return na not in ancestors[nb] and nb not in ancestors[na]
+        loop = loops.get(na)
+        if loop is None or loop.fix in (a, b):
+            return False  # fix runs alone, between body rounds
+        anc = body_anc[na]
+        return a not in anc[b] and b not in anc[a]
+
+    by_target: dict[str, list[StepDef]] = {}
+    for s in pipeline.steps:
+        if s.resume:
+            by_target.setdefault(s.resume, []).append(s)
+    for target, resumers in by_target.items():
+        for i, a in enumerate(resumers):
+            for b in resumers[i + 1:]:
+                if (not a.fork or not b.fork) and may_overlap(a.id, b.id):
                     raise ValidationError(
-                        f"Step '{step.id}': route goto references unknown target '{t}'"
+                        f"Steps '{a.id}' and '{b.id}' both resume '{target}' and may run "
+                        f"concurrently; without `fork: true` they would write into the "
+                        f"same session. Set `fork: true` on both, or order them with `after`."
                     )
-        if step.check and step.check.routes:
-            for cr in step.check.routes:
-                targets = cr.goto if isinstance(cr.goto, list) else [cr.goto]
-                for t in targets:
-                    if t not in step_ids and t not in specials:
-                        raise ValidationError(
-                            f"Step '{step.id}': check.routes goto references "
-                            f"unknown target '{t}'"
-                        )
 
 
-def _check_trigger_route_reachable(
-    steps: list[StepDef], step_ids: set[str], warnings: list[str]
-) -> None:
-    """Warn if trigger:route steps are never targeted by any goto."""
-    route_steps = {s.id for s in steps if s.trigger == "route"}
-    if not route_steps:
-        return
-
-    goto_targets: set[str] = set()
-    for step in steps:
-        if step.routes:
-            for route in step.routes:
-                if isinstance(route.goto, list):
-                    goto_targets.update(route.goto)
-                else:
-                    goto_targets.add(route.goto)
-        if step.check and step.check.routes:
-            for cr in step.check.routes:
-                if isinstance(cr.goto, list):
-                    goto_targets.update(cr.goto)
-                else:
-                    goto_targets.add(cr.goto)
-
-    unreachable = route_steps - goto_targets
-    for sid in unreachable:
-        warnings.append(
-            f"Step '{sid}' has trigger:route but is never targeted by any goto"
-        )
-
-
-def _check_loop_protection(
-    steps: list[StepDef], step_map: dict[str, StepDef]
-) -> None:
-    """Ensure steps with back-jump routes have max_iterations set."""
-    step_order = {s.id: i for i, s in enumerate(steps)}
-    for step in steps:
-        if not step.routes:
-            continue
-        for route in step.routes:
-            targets = route.goto if isinstance(route.goto, list) else [route.goto]
-            for t in targets:
-                if t in step_order and step_order[t] <= step_order[step.id]:
-                    if not step.max_iterations:
-                        raise ValidationError(
-                            f"Step '{step.id}': goto back-jump to '{t}' requires "
-                            f"max_iterations to prevent infinite loops"
-                        )
-
-
-def _check_loop_body(
-    steps: list[StepDef],
-    step_ids: set[str],
-    step_map: dict[str, StepDef],
-) -> None:
-    """Validate explicit loop_body declarations (catch author typos early).
-
-    A declared loop_body replaces the engine's reverse-derivation, so a typo'd
-    or malformed member would silently re-run the wrong set. Enforce that:
-      - every member is a real step id;
-      - members are DAG steps (trigger != route) — route steps are reached only
-        via goto, never as part of subgraph re-execution;
-      - the step does not list itself (origin is re-run separately);
-      - the declaring step actually has a back-jump route (else loop_body is
-        dead config).
-    """
-    step_order = {s.id: i for i, s in enumerate(steps)}
-    for step in steps:
-        if step.loop_body is None:
-            continue
-
-        has_back_jump = False
-        for route in step.routes or []:
-            targets = route.goto if isinstance(route.goto, list) else [route.goto]
-            if any(
-                t in step_order and step_order[t] <= step_order[step.id]
-                for t in targets
-            ):
-                has_back_jump = True
-        if not has_back_jump:
-            raise ValidationError(
-                f"Step '{step.id}': declares loop_body but has no back-jump route "
-                f"— loop_body only applies to a step that jumps backward"
-            )
-
-        for member in step.loop_body:
-            if member not in step_ids:
-                raise ValidationError(
-                    f"Step '{step.id}': loop_body references unknown step '{member}'"
-                )
-            if member == step.id:
-                raise ValidationError(
-                    f"Step '{step.id}': loop_body must not list the step itself"
-                )
-            if step_map[member].trigger == "route":
-                raise ValidationError(
-                    f"Step '{step.id}': loop_body member '{member}' is trigger:route; "
-                    f"only DAG steps can be part of a re-executed loop body"
-                )
-
-
-def _check_when_syntax(steps: list[StepDef]) -> None:
-    """Reject malformed when-expressions at validate time.
-
-    eval_when resolves unknown inputs to "" (never raises for a missing var),
-    so evaluating against empty inputs exercises only the parse/allowed-node
-    path. A TemplateError here is therefore a genuine syntax or unsupported-
-    construct error, which should fail validation rather than be swallowed.
-    """
-    for step in steps:
-        if step.when:
-            try:
-                eval_when(step.when, {})
-            except TemplateError as e:
-                raise ValidationError(
-                    f"Step '{step.id}': invalid when expression: {e}"
-                ) from e
-
-
-def _check_check_fields(steps: list[StepDef]) -> None:
-    for step in steps:
-        if not step.check:
-            continue
-        if step.check.success_pattern and step.check.routes:
-            raise ValidationError(
-                f"Step '{step.id}': check.success_pattern and check.routes "
-                f"are mutually exclusive"
-            )
-        if not step.check.success_pattern and not step.check.routes:
-            raise ValidationError(
-                f"Step '{step.id}': check must have either success_pattern or routes"
+def _warn_unused_verdicts(pipeline: Pipeline, warnings: list[str]) -> None:
+    read: set[str] = set()
+    for s in pipeline.steps:
+        if s.when:
+            read |= expr_refs(parse_expr(s.when))[1]
+    for loop in pipeline.loops:
+        read |= expr_refs(parse_expr(loop.until))[1]
+    for s in pipeline.steps:
+        if s.verdict and s.id not in read:
+            warnings.append(
+                f"Step '{s.id}' declares a verdict that no when/until reads"
             )
 
 
-def _check_glob_without_after(
-    steps: list[StepDef],
-    output_map: dict[str, str],
-    warnings: list[str],
-) -> None:
-    """Warn if inject has glob but no after referencing steps that write matching outputs."""
-    for step in steps:
-        for pattern in step.inject:
-            if "*" not in pattern and "?" not in pattern:
-                continue
-            has_relevant_after = any(
-                out_path
-                for out_path, sid in output_map.items()
-                if sid in step.after
-            )
-            if not has_relevant_after and step.after == []:
+def _warn_globs_without_after(steps: list[StepDef], warnings: list[str]) -> None:
+    for s in steps:
+        for pattern in s.inject:
+            if is_glob(pattern) and not s.after:
                 warnings.append(
-                    f"Step '{step.id}': injects glob '{pattern}' but has no "
-                    f"'after' dependencies — files may not exist at runtime"
+                    f"Step '{s.id}': injects glob '{pattern}' but has no 'after' — "
+                    f"globs don't create dependencies, so matches may not exist yet"
                 )

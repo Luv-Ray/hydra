@@ -1,5 +1,5 @@
+version: 2
 name: hello-world
-version: 1
 
 defaults:
   allowed_tools: [Read, Write, Bash]
@@ -8,5 +8,5 @@ workdir: /tmp/hydra-hello
 
 steps:
   - id: greet
-    prompt: "Create a file called hello.txt containing 'Hello from Hydra!'. Nothing else."
+    prompt: "Create a file called hello.txt containing 'Hello from Hydra!'. Then reply with one line saying what you did."
     output: result.md

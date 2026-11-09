@@ -63,20 +63,32 @@ def test_missing_precise_inject_raises_on_forward_run(tmp_path: Path):
         )
 
 
-def test_missing_precise_inject_tolerated_when_allow_missing(tmp_path: Path):
-    # In a back-jump loop an upstream artifact may not exist yet on the first
-    # pass, so allow_missing skips it silently.
+def test_missing_precise_inject_tolerated_only_when_listed(tmp_path: Path):
+    # The engine lists outputs whose producer has not produced yet (skipped, or
+    # not run yet this loop round); only those may be absent.
     out = build_prompt(
         prompt="use the file",
         inject_paths=["ghost.md"],
         workdir=str(tmp_path),
-        allow_missing=True,
+        tolerate_missing={"ghost.md"},
     )
     assert out == "use the file"
+    with pytest.raises(FileNotFoundError, match="other.md"):
+        build_prompt(
+            prompt="x", inject_paths=["ghost.md", "other.md"],
+            workdir=str(tmp_path), tolerate_missing={"ghost.md"},
+        )
+
+
+def test_verdict_contract_appended_last(tmp_path: Path):
+    out = build_prompt(prompt="Review", inject_paths=[], output_path="r.md",
+                       verdict_values=["ACCEPT", "REJECT"])
+    assert out.index("Review") < out.index("Output contract") < out.index("Verdict contract")
+    assert "ACCEPT / REJECT" in out
 
 
 def test_missing_glob_never_raises(tmp_path: Path):
-    # Globs skip non-matches regardless of allow_missing — no file is "expected".
+    # Globs skip non-matches — no specific file is "expected".
     out = build_prompt(
         prompt="use the files",
         inject_paths=["*.md"],

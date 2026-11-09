@@ -2,9 +2,9 @@
 
 Writes an append-only events.jsonl (always on, cheap) into the run dir and
 mirrors each event as a concise human-readable line on stderr. This is the
-authoritative record of control-flow decisions — check evaluations, routing,
-back-jumps, iteration counts, and termination — which stdout logs alone can't
-reconstruct after the fact.
+authoritative record of control-flow decisions, which stdout logs alone can't
+reconstruct after the fact: step starts/results, abnormal outcomes, verdicts,
+skips, loop rounds, compactions, and termination.
 """
 
 from __future__ import annotations
@@ -37,21 +37,27 @@ class EventLog:
     # --- Control-flow event helpers -------------------------------------
 
     def step_start(
-        self, step_id: str, *, trigger: str, execution: int,
-        resume: str | None, inject_count: int,
+        self, step_id: str, *, execution: int, resume: str | None,
+        fork: bool, inject_count: int, loop: str | None = None,
     ) -> None:
         extra = []
         if execution > 1:
             extra.append(f"run #{execution}")
         if resume:
-            extra.append(f"resume={resume}")
+            extra.append(f"{'fork' if fork else 'resume'}={resume}")
         if inject_count:
             extra.append(f"inject={inject_count}")
         suffix = f" ({', '.join(extra)})" if extra else ""
         self.emit(
             "step_start", f"→ {step_id}{suffix}",
-            step=step_id, trigger=trigger, execution=execution,
-            resume=resume, inject_count=inject_count,
+            step=step_id, execution=execution, resume=resume, fork=fork,
+            inject_count=inject_count, loop=loop,
+        )
+
+    def skip(self, step_id: str, *, when: str, execution: int) -> None:
+        self.emit(
+            "skip", f"  skip {step_id} (when: {when})",
+            step=step_id, when=when, execution=execution,
         )
 
     def step_result(
@@ -77,10 +83,10 @@ class EventLog:
         self, step_id: str, *, reason: str, will_retry: bool,
         attempt: int, budget: int,
     ) -> None:
-        """A step produced no trustworthy answer (empty/api-error/error-subtype).
+        """A step produced no trustworthy answer (errored, empty, no verdict).
 
-        Distinct from a model REJECT: this never routes as a check-failure. It
-        either retries within its abnormal budget or hard-fails the pipeline.
+        Distinct from a verdict like REJECT, which is a real answer. This either
+        retries within the step's `retry` budget or fails the pipeline.
         """
         tail = (
             f"retry {attempt}/{budget}" if will_retry
@@ -93,47 +99,30 @@ class EventLog:
             attempt=attempt, budget=budget,
         )
 
-    def check(
-        self, step_id: str, *, mode: str, pattern: str | None,
-        matched: bool, verdict: str, target: str | None = None,
-    ) -> None:
-        if mode == "success_pattern":
-            hit = "matched" if matched else "not matched"
-            human = f"  check {step_id}: /{pattern}/ {hit} → {verdict}"
-        elif mode == "routes" and target:
-            human = f"  check {step_id}: /{pattern}/ matched → goto {target}"
-        else:
-            human = f"  check {step_id}: no pattern matched → {verdict}"
-        self.emit(
-            "check", human,
-            step=step_id, mode=mode, pattern=pattern,
-            matched=matched, verdict=verdict, target=target,
-        )
-
-    def route(
-        self, step_id: str, *, condition: str, target: Any, kind: str,
+    def verdict(
+        self, step_id: str, *, verdict: str, line: str, execution: int,
     ) -> None:
         self.emit(
-            "route", f"  route {step_id}: {condition} → {kind} {target}",
-            step=step_id, condition=condition, target=target, kind=kind,
+            "verdict", f"  verdict {step_id}: {verdict}",
+            step=step_id, verdict=verdict, line=line, execution=execution,
         )
 
-    def back_jump(
-        self, origin: str, *, targets: list[str], subgraph: list[str],
-        iteration: int, max_iterations: int,
+    def loop_round(
+        self, loop_id: str, *, round: int, max_rounds: int,
+        until: str, satisfied: bool,
     ) -> None:
+        tail = "until satisfied" if satisfied else "until not satisfied"
         self.emit(
-            "back_jump",
-            f"  back-jump {origin} → {targets} "
-            f"(iteration {iteration}/{max_iterations}, re-run {subgraph})",
-            origin=origin, targets=targets, subgraph=subgraph,
-            iteration=iteration, max_iterations=max_iterations,
+            "loop_round",
+            f"  loop {loop_id}: round {round}/{max_rounds} → {tail}",
+            loop=loop_id, round=round, max_rounds=max_rounds,
+            until=until, satisfied=satisfied,
         )
 
-    def retry(self, step_id: str, *, attempt: int, max_retries: int) -> None:
+    def loop_done(self, loop_id: str, *, status: str, rounds: int) -> None:
         self.emit(
-            "retry", f"  retry {step_id}: attempt {attempt}/{max_retries}",
-            step=step_id, attempt=attempt, max_retries=max_retries,
+            "loop_done", f"  loop {loop_id}: {status} after {rounds} round(s)",
+            loop=loop_id, status=status, rounds=rounds,
         )
 
     def compact(

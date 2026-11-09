@@ -1,24 +1,33 @@
 # Hydra
 
-**Declaratively orchestrate fully autonomous AI-agent workflows in YAML.** You write down how a task splits into steps, how the steps hand off to each other, and when to loop back and redo — the engine runs it to completion, with no human in the loop.
+**Declaratively orchestrate fully autonomous AI-agent workflows in YAML.** You write down how a task splits into steps, how the steps hand off to each other, and what to redo until it is good enough. The engine runs it to completion, with no human in the loop.
 
 It runs on Anthropic's official [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python), and each step's execution quality is aligned with Claude Code: every step is an autonomous agent session with the full tool surface (Read/Write/Bash/Grep/MCP…).
 
 ```yaml
-name: analyze
+version: 2
 steps:
   - id: investigate
-    prompt: Read the codebase, find the root cause of this bug, output analysis and a fix.
+    prompt: Read the codebase, find the root cause of this bug, and propose a fix.
     output: root-cause.md
 
   - id: review
-    inject: [root-cause.md]        # feed the previous step's artifact into this prompt
-    prompt: Review the analysis above. Reply only ACCEPT or REJECT.
-    check:
-      success_pattern: ACCEPT
-    routes:
-      - if: failure
-        goto: investigate          # REJECT → jump back and redo
+    inject: [root-cause.md]          # feed the previous step's artifact into this prompt
+    prompt: Review the analysis above. List every problem you find.
+    output: review.md
+    verdict: [ACCEPT, REJECT]        # the reply's last line decides
+
+  - id: revise
+    resume: investigate              # continue the original analyst's session
+    inject: [review.md]
+    prompt: Fix every problem in the review, then overwrite root-cause.md.
+
+loops:
+  - id: review_loop
+    body: [review]
+    fix: revise                      # runs between rounds
+    until: "steps.review.verdict == 'ACCEPT'"
+    max_rounds: 3
 ```
 
 ```bash
@@ -35,56 +44,46 @@ Hydra's identity comes from a few deliberate trade-offs. Understand these and yo
 
 Most orchestration frameworks pass agent-to-agent messages in process memory. Hydra inverts that: **every step's output is a file on disk, and the next step explicitly declares which files it reads.**
 
-- `output: path` — the step's reply body, saved verbatim by the framework as that file.
-- `inject: [paths]` — the contents of these files are injected at the front of this step's prompt.
+- `output: path`: the step's reply body, saved verbatim by the framework as that file.
+- `inject: [paths]`: the contents of these files are injected at the front of this step's prompt.
 
-Three payoffs follow directly. Context is **inspectable** — what each step produces and what the next consumes are files you can open and read. Runs are **interruptible and resumable** — artifacts live on disk, so a restart loses nothing. And steps are **decoupled** — they collaborate only through a file contract, sharing no in-memory state.
+Context is **inspectable** (you can open what each step produced and consumed), runs are **resumable** (artifacts live on disk), and steps are **decoupled** (they share nothing but files). Each step is its own agent session that sees only its own prompt and the files it injects, so prompts should be self-contained.
 
-This comes with an **output contract**: for a step that declares `output:`, its reply *is* the file content and the framework does the writing — the agent should not also Write the file itself. The contract is appended to the prompt automatically, so the agent emits the artifact rather than framing its reply as a chat message with preamble and sign-off.
+A step that declares `output:` gets an **output contract** appended to its prompt: its reply *is* the file content, written by the framework, so the agent should neither frame it as a chat message nor write the file itself.
 
-### 2. `resume` for 1:1 session continuation
-
-Beyond the lightweight "read a file" handoff, Hydra can carry **an entire conversation history** forward:
+### 2. `resume` continues a whole conversation
 
 ```yaml
   - id: revise
-    resume: investigate            # continue investigate's full session
-    inject: [review.md]            # then feed in the review feedback
-    prompt: Revise your analysis per the review.
+    resume: investigate              # append to investigate's session
+  - id: second_opinion
+    resume: investigate
+    fork: true                       # continue in a copy, leave the original alone
 ```
 
-`resume: step_id` continues the current step from the full context the target step ended with — the agent remembers what it read and where its reasoning stood. This is what makes "analyze → get critiqued → go back and fix it" loops work well: the reviser *is* the original analyst, without having to re-inject all the background. Pair it with `compact_before_resume` to compact the history before continuing and keep context usage in check.
+`resume: step_id` continues from the full context the target ended with: the agent remembers what it read and where its reasoning stood. That is what makes "analyze → get critiqued → fix it" work well: the reviser *is* the original analyst. By default the turns are appended to the target's session, so a second revision remembers the first. `fork: true` branches a copy instead, which is what parallel readers of one session need (the validator requires it when they may run concurrently). `compact_before_resume` compacts a heavy session first.
 
-### 3. DAG parallelism + routing + back-jump loops
+### 3. Three control-flow concepts, nothing else
 
-Dependencies between steps (from `after:`, or implied by `inject:`) are inferred into a DAG and **executed layer by layer in parallel** — independent steps on the same layer run concurrently.
+- **Dependencies** come from `after:`, `resume:`, exact-path `inject:` matching another step's `output:`, and verdicts read in `when:`. Scheduling is **dataflow**: each step starts the moment everything it depends on is done, so independent branches run in parallel and a slow branch never holds up an unrelated one.
+- **Branching is `when:`** over inputs or upstream verdicts. A `verdict:` declares a closed set of values; the engine reads exactly one of them from the last line of the reply.
 
-Each step can end with one decision that determines where control goes next:
+  ```yaml
+  - {id: triage, verdict: [fixable, refactor, wontfix], prompt: ...}
+  - {id: fix, when: "steps.triage.verdict == 'fixable'", prompt: ...}
+  ```
 
-```yaml
-    check:
-      success_pattern: ACCEPT      # or use check.prompt to let another agent adjudicate
-    routes:
-      - if: success
-        goto: next_step            # forward jump
-      - if: failure
-        goto: investigate          # back jump — forms a revise loop
-```
+- **Repetition is a declared loop**: re-run `body` until `until` holds, running `fix` between rounds, at most `max_rounds` times. When it never converges, `on_exhausted: continue` carries the last round forward instead of failing the run.
 
-- **Forward jumps** hand control to steps outside the DAG (`trigger: route` steps are reachable only via goto).
-- **Back jumps** return to an upstream step, forming a "do → review → fail → go back and fix → review again" loop. Each back jump is a fresh session that reads the latest file contents.
-- `max_iterations` bounds a loop so it can't reject forever; when it doesn't converge you can route to "emit a report with the last version" instead of failing the whole run.
+There is no goto. Every edge is visible in the YAML, and `hydra validate` checks all of it statically: unknown keys, dangling references, cycles, verdict values compared against a typo, unsafe concurrent resumes.
 
-### 4. Retry with feedback — and "transient failure" split from "semantic rejection"
+### 4. A verdict is an answer; a failure is not
 
-Two kinds of "didn't succeed" are different things, and Hydra handles them with separate budgets:
-
-- **Semantic rejection** (a reviewer returns REJECT): a meaningful conclusion, not something to blindly re-run. It should route via `routes` to a revise step. Set `retry: 0` on such a step so it routes on its verdict instead of wasting a rerun.
-- **Transient / infrastructure failure** (upstream stream interruption, empty output): this *should* be retried. `retry` + `retry_inject` re-run the step carrying the previous failure as feedback rather than starting blind. When the upstream SDK raises mid-stream, the engine converts it into a failed result handed to the retry machinery instead of crashing the whole pipeline.
+A reviewer replying REJECT gave a real answer, and loops act on it. A step that errored, timed out, returned an empty body, or ended without a readable verdict gave **no** answer. That is retried (`retry`, default 1) and then fails the run. It is never mistaken for REJECT, so a transient API blip can't trigger a pointless revise round.
 
 ### 5. Fully autonomous, file-in / file-out
 
-No human-in-the-loop checkpoints. Input is CLI arguments (`--var`) plus files in the working directory; output is files in the working directory. That makes Hydra suited to running long flows unattended — triage, code review, batch analysis. Run state is persisted under `.hydra/runs/`, and `--resume-last` / `--resume RUN_ID` continue an interrupted run.
+No human-in-the-loop checkpoints. Input is CLI arguments (`--var`) plus files in the working directory; output is files in the working directory. That suits long unattended flows: triage, code review, batch analysis. Run state is persisted under `.hydra/runs/`, and `--resume-last` / `--resume RUN_ID` continue an interrupted run, reusing every finished step and finished loop.
 
 ---
 
@@ -98,10 +97,10 @@ Requires Python ≥ 3.10, plus `claude-agent-sdk`, `click`, and `pyyaml`.
 
 ## Configuration
 
-Hydra runs on the Claude Agent SDK, which drives the same `claude` CLI that Claude Code uses. **Its configuration is therefore whatever Claude Code already uses on your machine** — there is nothing Hydra-specific to set up:
+Hydra runs on the Claude Agent SDK, which drives the same `claude` CLI that Claude Code uses. **Its configuration is therefore whatever Claude Code already uses on your machine.** There is nothing Hydra-specific to set up:
 
-- **Authentication** — the same credentials Claude Code runs on (a logged-in session, or `ANTHROPIC_API_KEY`). If `claude` works in your terminal, Hydra works.
-- **Settings, MCP servers, model access** — inherited from your existing Claude Code / CLI configuration. A pipeline can additionally declare its own `mcp_servers`, which are passed straight through to the SDK.
+- **Authentication**: the same credentials Claude Code runs on (a logged-in session, or `ANTHROPIC_API_KEY`). If `claude` works in your terminal, Hydra works.
+- **Settings, MCP servers, model access**: inherited from your existing Claude Code / CLI configuration. A pipeline can additionally declare its own `mcp_servers`, which are passed straight through to the SDK.
 
 If you don't have it yet, install and authenticate the Claude CLI first (see the [Claude Code docs](https://docs.claude.com/en/docs/claude-code)), then point Hydra at a pipeline.
 
@@ -111,7 +110,7 @@ If you don't have it yet, install and authenticate the Claude CLI first (see the
 hydra run pipeline.yaml                     # execute
 hydra run pipeline.yaml --var issue_id=123  # pass an input
 hydra run pipeline.yaml --resume-last       # continue the most recent interrupted run
-hydra run pipeline.yaml --dry-run           # print the execution plan without running
+hydra run pipeline.yaml --dry-run           # print the schedule without running
 hydra validate pipeline.yaml                # static checks, no execution
 ```
 
@@ -120,22 +119,22 @@ hydra validate pipeline.yaml                # static checks, no execution
 ```
 YAML pipeline
      │
-  loader.py     parse + template expansion + defaults merge
+  loader.py + models.py   strict parse, inputs, defaults, templates
      │
-  validate.py   static validation
+  validate.py             references, expressions, loops, cycles, resume safety
      │
-  dag.py        dependency inference + topological sort
+  dag.py                  dependency inference → scheduling graph (steps + loop nodes)
      │
-  executor.py   DAG execution + routes + retry + goto
+  executor.py             dataflow scheduler, when, loops, verdicts, retries
      │
-     ├── provider.py     Claude Agent SDK calls
-     ├── inject.py       file injection / output contract
-     ├── events.py       structured event stream (control-flow observability)
-     └── persistence.py  .hydra/runs/ persistence
+     ├── provider.py      Claude Agent SDK calls (run / verdict follow-up / compact)
+     ├── inject.py        file injection, output & verdict contracts
+     ├── events.py        structured event stream (control-flow observability)
+     └── persistence.py   .hydra/runs/ persistence and resume
 ```
 
 ## Docs & examples
 
-- Full DSL reference (fields and semantics): [`docs/specs/dsl-reference.md`](docs/specs/dsl-reference.md) — code is the source of truth. *(In Chinese.)*
+- Full DSL reference (fields and semantics): [`docs/specs/dsl-reference.md`](docs/specs/dsl-reference.md). Code is the source of truth. *(In Chinese.)*
 - Design notes: [`docs/design.md`](docs/design.md) *(In Chinese.)*
-- Examples: [`examples/hello-world.yaml`](examples/hello-world.yaml) (minimal skeleton) and [`examples/anr-fc-analysis.yaml`](examples/anr-fc-analysis.yaml) (a real-scale multi-step analysis pipeline with DAG fan-out, resume, back-jump revise loops, and per-step tool scoping).
+- Examples: [`examples/hello-world.yaml`](examples/hello-world.yaml) (minimal) and [`examples/bug-analysis.yaml`](examples/bug-analysis.yaml) (a cheap gate loop before a parallel review-panel loop, resume-based revision, `when` on a loop's outcome, per-step tool scoping).

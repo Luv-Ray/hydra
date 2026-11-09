@@ -1,0 +1,103 @@
+# Root-cause analysis with two review loops.
+#
+#   analyze ─► [gate loop: screen ⇄ patch] ─► [panel loop: evidence ∥ alternatives ─► judge ⇄ revise] ─► report
+#                                                                                         └─ open_questions (when judge never accepted)
+#
+# - gate: a cheap screen catches obvious gaps; patch fixes them in analyze's own session.
+# - panel: two reviewers run in parallel, judge aggregates; revise fixes in analyze's session.
+#   The expensive panel runs only after the gate converged — never inside its rounds.
+# - Both loops continue on exhaustion, so the run still ends with a report.
+
+version: 2
+name: bug-analysis
+
+inputs:
+  bug:
+    description: "Bug description or issue text"
+    required: true
+
+defaults:
+  model: claude-sonnet-5-5
+  allowed_tools: [Read, Glob, Grep, Bash]
+
+system_prompt: |
+  You are a senior engineer doing root-cause analysis. Cite file:line for every claim about the code.
+
+steps:
+  - id: analyze
+    prompt: |
+      Bug: {{ inputs.bug }}
+      Investigate the codebase, find the root cause, and propose a fix.
+    output: root-cause.md
+
+  - id: screen
+    inject: [root-cause.md]
+    allowed_tools: [Read]
+    prompt: |
+      Check the analysis above for obvious gaps only: a root cause with no cited code,
+      a fix that does not address the stated cause, or a missing reproduction path.
+      List each gap you find. Deeper review is not in scope for this step.
+    output: screen.md
+    verdict: [ACCEPT, REJECT]
+    retry: 0
+
+  - id: patch
+    resume: analyze
+    inject: [screen.md]
+    allowed_tools: [Read, Glob, Grep, Bash, Write]
+    prompt: "Address every gap listed above, then overwrite root-cause.md with the corrected analysis."
+
+  - id: evidence
+    after: [screen]
+    inject: [root-cause.md]
+    allowed_tools: [Read, Grep]
+    prompt: "Verify every file:line citation in the analysis against the code. Report each one that is wrong or does not support its claim."
+    output: review-evidence.md
+
+  - id: alternatives
+    after: [screen]
+    inject: [root-cause.md]
+    prompt: "Propose the strongest alternative root causes and the evidence that would rule each in or out. Check that evidence in the code."
+    output: review-alternatives.md
+
+  - id: judge
+    inject: [root-cause.md, review-evidence.md, review-alternatives.md]
+    allowed_tools: [Read]
+    prompt: "Weigh the reviews against the analysis. Decide whether the analysis stands as written; if not, list exactly what must change."
+    output: judgement.md
+    verdict: [ACCEPT, REJECT]
+    retry: 0
+
+  - id: revise
+    resume: analyze
+    inject: [judgement.md]
+    allowed_tools: [Read, Glob, Grep, Bash, Write]
+    prompt: "Resolve every point in the judgement above, then overwrite root-cause.md with the revised analysis."
+
+  - id: report
+    inject: [root-cause.md, judgement.md]
+    allowed_tools: [Read]
+    prompt: "Write the final report: root cause, evidence, fix, and any residual doubts raised in the judgement."
+    output: final-report.md
+
+  - id: open_questions
+    when: "steps.judge.verdict == 'REJECT'"
+    inject: [judgement.md]
+    allowed_tools: [Read]
+    prompt: "The analysis was not accepted within the review budget. List the unresolved points as concrete questions for a human."
+    output: open-questions.md
+
+loops:
+  - id: gate
+    body: [screen]
+    fix: patch
+    until: "steps.screen.verdict == 'ACCEPT'"
+    max_rounds: 3
+    on_exhausted: continue
+
+  - id: panel
+    body: [evidence, alternatives, judge]
+    fix: revise
+    until: "steps.judge.verdict == 'ACCEPT'"
+    max_rounds: 2
+    on_exhausted: continue

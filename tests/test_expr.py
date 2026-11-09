@@ -4,8 +4,32 @@ from __future__ import annotations
 
 import pytest
 
-from hydra.expr import eval_when, expand_template
+from hydra.expr import eval_expr, expand_template, expr_refs, parse_expr, verdict_literals
 from hydra.errors import TemplateError
+
+
+def eval_when(expr, inputs, verdicts=None):
+    return eval_expr(parse_expr(expr), inputs, verdicts or {})
+
+
+def test_verdict_references():
+    expr = "steps.review.verdict == 'ACCEPT' or steps.gate.verdict in ['OK', 'SKIP']"
+    assert eval_when(expr, {}, {"review": "ACCEPT"}) is True
+    assert eval_when(expr, {}, {"gate": "SKIP"}) is True
+    # A step with no verdict (skipped / not run) reads as None and matches nothing.
+    assert eval_when(expr, {}, {}) is False
+    assert eval_when("steps.gate.verdict == None", {}, {}) is True
+    assert expr_refs(parse_expr(expr)) == (set(), {"review", "gate"})
+    assert sorted(verdict_literals(parse_expr(expr))) == [
+        ("gate", "OK"), ("gate", "SKIP"), ("review", "ACCEPT"),
+    ]
+
+
+def test_unsupported_constructs_rejected():
+    for bad in ("steps.a.output == 'x'", "inputs.a[0] == 'x'", "len(inputs.a) == 1",
+                "inputs.a < 'b'", "steps.a.verdict == inputs.b + 'x'"):
+        with pytest.raises(TemplateError):
+            parse_expr(bad)
 
 
 def test_expand_simple():

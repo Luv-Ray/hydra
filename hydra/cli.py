@@ -56,7 +56,6 @@ def run(
 
         engine = ExecutionEngine(
             pipeline=pipeline,
-            inputs=vars_dict,
             concurrency=concurrency,
             dry_run=dry_run,
             verbose=verbose,
@@ -97,8 +96,7 @@ def validate(
 
         click.echo(f"Pipeline '{pipeline.name}' is valid.")
         click.echo(f"  Steps: {len(pipeline.steps)}")
-        click.echo(f"  DAG steps: {sum(1 for s in pipeline.steps if s.trigger == 'dag')}")
-        click.echo(f"  Route steps: {sum(1 for s in pipeline.steps if s.trigger == 'route')}")
+        click.echo(f"  Loops: {len(pipeline.loops)}")
 
         if warnings:
             click.echo()

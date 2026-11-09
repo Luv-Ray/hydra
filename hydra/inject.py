@@ -1,85 +1,68 @@
-"""File-based content injection for step prompts."""
+"""Prompt assembly: file injection plus the output / verdict contracts."""
 
 from __future__ import annotations
 
 import glob as globmod
+from collections.abc import Collection
 from pathlib import Path
+
+from .dag import is_glob
+
+SEPARATOR = "\n\n---\n\n"
 
 
 def build_prompt(
     prompt: str,
     inject_paths: list[str],
     workdir: str | None = None,
-    retry_feedback: str | None = None,
     output_path: str | None = None,
-    allow_missing: bool = False,
+    verdict_values: list[str] | None = None,
+    tolerate_missing: Collection[str] = (),
     preamble: str | None = None,
 ) -> str:
-    """Assemble the full prompt: preamble + retry feedback + inject + step prompt.
+    """Assemble preamble + injected files + step prompt + contracts.
 
     Args:
-        prompt: The step's prompt text (already template-expanded).
-        inject_paths: File paths and glob patterns to inject.
-        workdir: Working directory for resolving relative paths.
-        retry_feedback: Optional feedback from previous attempt to prepend.
-        preamble: Pipeline-wide text prepended before everything else (applied
-            to every step). Already template-expanded by the loader.
-        output_path: If set, the step captures the reply body into this file.
-            A contract note is appended so the model understands its reply IS
-            the artifact, not a chat message about the work.
-        allow_missing: If True, silently skip precise inject files that don't
-            exist. Only valid in back-jump loops where an upstream artifact may
-            legitimately not exist yet on the first pass. When False (the normal
-            forward case), a missing precise file is a configuration error and
-            raises — otherwise a typo'd path is silently dropped. Globs always
-            skip non-matches regardless of this flag.
+        inject_paths: exact paths and glob patterns, relative to workdir.
+        output_path: set when the reply body is captured into a file; appends
+            the output contract.
+        verdict_values: set when the verdict is read from this reply; appends
+            the verdict contract.
+        tolerate_missing: exact inject paths that may legitimately be absent —
+            the engine passes the outputs of producers that have not produced
+            yet (skipped, or not run yet in the current loop round). Any other
+            missing exact path raises, so a typo'd path is never silently
+            dropped. Glob patterns with no match are always skipped.
     """
-    parts: list[str] = []
-
-    if preamble:
-        parts.append(preamble)
-
-    if retry_feedback:
-        parts.append(retry_feedback)
+    parts: list[str] = [preamble] if preamble else []
 
     for pattern in inject_paths:
         resolved = _resolve_path(pattern, workdir)
-        if "*" in pattern or "?" in pattern:
-            matches = sorted(globmod.glob(resolved, recursive=True))
-            for match in matches:
-                content = Path(match).read_text()
-                display_path = _display_path(match, workdir)
-                parts.append(f"[File: {display_path}]\n{content}")
-        else:
-            path = Path(resolved)
-            if not path.exists():
-                if allow_missing:
-                    continue
-                raise FileNotFoundError(
-                    f"Inject file not found: {pattern} (resolved: {resolved}). "
-                    f"If an upstream step declares this as its `output`, it most "
-                    f"likely produced an empty reply and wrote nothing — check "
-                    f"that step's result line / step_abnormal event in the run "
-                    f"logs rather than the inject path itself."
-                )
-            content = path.read_text()
-            display_path = _display_path(resolved, workdir)
-            parts.append(f"[File: {display_path}]\n{content}")
+        if is_glob(pattern):
+            for match in sorted(globmod.glob(resolved, recursive=True)):
+                parts.append(f"[File: {_display_path(match, workdir)}]\n{Path(match).read_text()}")
+            continue
+        path = Path(resolved)
+        if not path.exists():
+            if pattern in tolerate_missing:
+                continue
+            raise FileNotFoundError(
+                f"Inject file not found: {pattern} (resolved: {resolved}). If a step "
+                f"declares this as its `output`, it ran but wrote nothing — check its "
+                f"step_abnormal event in the run logs rather than the inject path."
+            )
+        parts.append(f"[File: {_display_path(resolved, workdir)}]\n{path.read_text()}")
 
-    if parts:
-        prefix = "\n\n---\n\n".join(parts)
-        full = f"{prefix}\n\n---\n\n{prompt}"
-    else:
-        full = prompt
-
+    parts.append(prompt)
     if output_path:
-        full = f"{full}\n\n---\n\n{_output_contract()}"
+        parts.append(output_contract())
+    if verdict_values:
+        parts.append(verdict_contract(verdict_values))
+    return SEPARATOR.join(parts)
 
-    return full
 
-
-def _output_contract() -> str:
-    """Note appended when a step captures its reply body into a file.
+def output_contract() -> str:
+    """Appended when a step captures its reply body into a file.
 
     Addresses two failure modes:
     1. Framing — models default to writing a reply *to a human* (preamble,
@@ -100,54 +83,28 @@ def _output_contract() -> str:
     )
 
 
+def verdict_contract(values: list[str]) -> str:
+    """Appended to whichever reply the verdict is read from.
 
-def read_inject_files(
-    inject_paths: list[str],
-    workdir: str | None = None,
-    allow_missing: bool = False,
-) -> list[tuple[str, str]]:
-    """Read inject files and return (display_path, content) pairs.
-
-    Args:
-        allow_missing: If True, skip missing precise files instead of raising.
+    The engine parses only the last non-empty line, so the model is told that
+    explicitly — a verdict stated mid-reply and then revised further down would
+    otherwise be ambiguous.
     """
-    results: list[tuple[str, str]] = []
-
-    for pattern in inject_paths:
-        resolved = _resolve_path(pattern, workdir)
-        if "*" in pattern or "?" in pattern:
-            matches = sorted(globmod.glob(resolved, recursive=True))
-            for match in matches:
-                content = Path(match).read_text()
-                results.append((_display_path(match, workdir), content))
-        else:
-            path = Path(resolved)
-            if not path.exists():
-                if allow_missing:
-                    continue
-                raise FileNotFoundError(
-                    f"Inject file not found: {pattern} (resolved: {resolved}). "
-                    f"If an upstream step declares this as its `output`, it most "
-                    f"likely produced an empty reply and wrote nothing — check "
-                    f"that step's result line / step_abnormal event in the run "
-                    f"logs rather than the inject path itself."
-                )
-            content = path.read_text()
-            results.append((_display_path(resolved, workdir), content))
-
-    return results
+    return (
+        f"[Verdict contract] End your reply with one final line that contains "
+        f"exactly one of: {' / '.join(values)}. The engine reads only that last "
+        f"line to decide what happens next: put nothing after it, and do not name "
+        f"the other values on it. If your reply is saved as a file, this line is "
+        f"part of the file."
+    )
 
 
 def count_inject(inject_paths: list[str], workdir: str | None = None) -> int:
-    """Count how many files would actually be injected (globs expanded).
-
-    Used for observability — reports how much context a step pulls in without
-    reading the file bodies.
-    """
+    """How many files would be injected right now (globs expanded)."""
     total = 0
     for pattern in inject_paths:
         resolved = _resolve_path(pattern, workdir)
-        if "*" in pattern or "?" in pattern:
+        if is_glob(pattern):
             total += len(globmod.glob(resolved, recursive=True))
         elif Path(resolved).exists():
             total += 1
