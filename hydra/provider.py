@@ -176,6 +176,37 @@ def _message_to_dict(msg: Any) -> dict[str, Any]:
     return out
 
 
+class Transcript:
+    """Full untruncated JSONL record of one provider.run() call.
+
+    Opened with truncation, so a retry's file reflects that attempt only. A
+    no-op when path is None.
+    """
+
+    def __init__(self, path: str | None):
+        self._f: TextIO | None = Path(path).open("w") if path else None
+
+    def write(self, record: dict[str, Any]) -> None:
+        if not self._f:
+            return
+        record = {"ts": datetime.now(timezone.utc).isoformat(), **record}
+        try:
+            line = json.dumps(record, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            line = json.dumps(
+                {"ts": record["ts"], "kind": record.get("kind", "?"),
+                 "unserializable": repr(record)[:2000]},
+                ensure_ascii=False,
+            )
+        self._f.write(line + "\n")
+        self._f.flush()
+
+    def close(self) -> None:
+        if self._f:
+            self._f.close()
+            self._f = None
+
+
 SYSTEM_PROMPT = (
     "You are running in a fully automated pipeline. "
     "There is no human operator to answer questions or confirm decisions. "
@@ -205,7 +236,6 @@ class ClaudeProvider:
     def __init__(self, verbose: bool = False):
         self.verbose = verbose
         self._trace: TextIO | None = None
-        self._transcript: TextIO | None = None
 
     def set_trace_file(self, path: Path | None) -> None:
         """Route the detailed agent trace (prompts, tool calls, check I/O) to a
@@ -267,8 +297,10 @@ class ClaudeProvider:
 
         # Full untruncated transcript for this run (see StepRunOptions). Record
         # the prompt we sent first, then every message as it streams in.
-        self._transcript_open(options.transcript_path)
-        self._transcript_write({"kind": "prompt", "text": prompt})
+        # Local to this call: concurrent steps share one provider, so a handle
+        # on self would be closed/overwritten by whichever step finishes first.
+        tr = Transcript(options.transcript_path)
+        tr.write({"kind": "prompt", "text": prompt})
 
         session_id: str | None = None
         result_text: str | None = None
@@ -297,7 +329,7 @@ class ClaudeProvider:
             nonlocal last_turn_input_tokens
             nonlocal subtype, stop_reason, api_error_status, errors
             async for msg in query(prompt=prompt, options=sdk_options):
-                self._transcript_write(_message_to_dict(msg))
+                tr.write(_message_to_dict(msg))
                 if isinstance(msg, AssistantMessage):
                     self._log_assistant(msg, options.step_id)
                     u = msg.usage or {}
@@ -340,10 +372,10 @@ class ClaudeProvider:
                 await _consume()
         except asyncio.TimeoutError:
             self._log(f"step '{options.step_id}' timed out after {options.timeout}s")
-            self._transcript_write(
+            tr.write(
                 {"kind": "timeout", "after_s": options.timeout}
             )
-            self._transcript_close()
+            tr.close()
             # session_id may be None here if the timeout fired before any
             # ResultMessage arrived. Surface that honestly rather than inventing
             # a "timeout-<id>" string — a fake id would sail through resume and
@@ -373,8 +405,8 @@ class ClaudeProvider:
             # asyncio.CancelledError is a BaseException on 3.8+, so `except
             # Exception` already lets genuine cancellation propagate.
             self._log(f"step '{options.step_id}' errored mid-stream: {exc}")
-            self._transcript_write({"kind": "error", "error": str(exc)})
-            self._transcript_close()
+            tr.write({"kind": "error", "error": str(exc)})
+            tr.close()
             # Prefer the structured error text the CLI already reported (in
             # `errors`); fall back to the raised exception message. This is what
             # surfaces in the step_abnormal event / ExecutionError reason, so
@@ -399,7 +431,7 @@ class ClaudeProvider:
                 errors=err_list,
             )
 
-        self._transcript_close()
+        tr.close()
 
         if session_id is None:
             raise RuntimeError(f"Step '{options.step_id}' did not return a session ID")
@@ -480,39 +512,6 @@ class ClaudeProvider:
                 return 0, 0
         finally:
             await client.disconnect()
-
-    def _transcript_open(self, path: str | None) -> None:
-        """Open (truncate) the per-run transcript file. No-op when path is None.
-
-        Truncates so a retry's transcript reflects that attempt, not a stale
-        concatenation — the run dir keeps prior attempts under run-N/ anyway.
-        """
-        if self._transcript:
-            self._transcript.close()
-            self._transcript = None
-        if path:
-            self._transcript = Path(path).open("w")
-
-    def _transcript_write(self, record: dict[str, Any]) -> None:
-        """Append one JSON record to the transcript, if one is open."""
-        if not self._transcript:
-            return
-        record = {"ts": datetime.now(timezone.utc).isoformat(), **record}
-        try:
-            line = json.dumps(record, ensure_ascii=False, default=str)
-        except (TypeError, ValueError):
-            line = json.dumps(
-                {"ts": record["ts"], "kind": record.get("kind", "?"),
-                 "unserializable": repr(record)[:2000]},
-                ensure_ascii=False,
-            )
-        self._transcript.write(line + "\n")
-        self._transcript.flush()
-
-    def _transcript_close(self) -> None:
-        if self._transcript:
-            self._transcript.close()
-            self._transcript = None
 
     def _log(self, message: str) -> None:
         """Write a detail line to the agent trace file (category 2).

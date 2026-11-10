@@ -7,10 +7,14 @@ empty final result are all preserved verbatim.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
-from hydra.provider import _block_to_dict, _message_to_dict, ClaudeProvider
+from hydra import provider as provider_mod
+from hydra.provider import (
+    ClaudeProvider, StepRunOptions, Transcript, _block_to_dict, _message_to_dict,
+)
 from claude_agent_sdk import ResultMessage
 from claude_agent_sdk.types import (
     AssistantMessage, TextBlock, ThinkingBlock, ToolUseBlock,
@@ -56,20 +60,14 @@ def test_message_dict_captures_thinking_only_turn():
 
 def test_transcript_file_written_and_valid_jsonl(tmp_path: Path):
     p = tmp_path / "transcript.jsonl"
-    prov = ClaudeProvider()
-    prov._transcript_open(str(p))
-    prov._transcript_write({"kind": "prompt", "text": "do the thing"})
-    prov._transcript_write(
-        _message_to_dict(
-            AssistantMessage(content=[TextBlock(text="ok")], model="m")
-        )
-    )
-    prov._transcript_write(_message_to_dict(_empty_result()))
-    prov._transcript_close()
+    tr = Transcript(str(p))
+    tr.write({"kind": "prompt", "text": "do the thing"})
+    tr.write(_message_to_dict(AssistantMessage(content=[TextBlock(text="ok")], model="m")))
+    tr.write(_message_to_dict(_empty_result()))
+    tr.close()
 
-    lines = p.read_text().strip().splitlines()
-    assert len(lines) == 3
-    recs = [json.loads(x) for x in lines]  # all valid JSON
+    recs = [json.loads(x) for x in p.read_text().strip().splitlines()]
+    assert len(recs) == 3
     assert recs[0]["kind"] == "prompt"
     assert recs[1]["content"] == [{"type": "text", "text": "ok"}]
     assert recs[2]["result"] == ""
@@ -77,19 +75,49 @@ def test_transcript_file_written_and_valid_jsonl(tmp_path: Path):
 
 
 def test_transcript_noop_when_no_path():
-    # No path set → writes are silently dropped, no crash.
-    prov = ClaudeProvider()
-    prov._transcript_open(None)
-    prov._transcript_write({"kind": "prompt", "text": "x"})  # must not raise
-    prov._transcript_close()
+    tr = Transcript(None)
+    tr.write({"kind": "prompt", "text": "x"})  # must not raise
+    tr.close()
 
 
 def test_transcript_handles_unserializable(tmp_path: Path):
     p = tmp_path / "t.jsonl"
-    prov = ClaudeProvider()
-    prov._transcript_open(str(p))
-    prov._transcript_write({"kind": "weird", "obj": object()})  # not JSON-native
-    prov._transcript_close()
-    rec = json.loads(p.read_text().strip())
+    tr = Transcript(str(p))
+    tr.write({"kind": "weird", "obj": object()})  # not JSON-native
+    tr.close()
     # default=str keeps it serializable rather than crashing the run.
-    assert rec["kind"] == "weird"
+    assert json.loads(p.read_text().strip())["kind"] == "weird"
+
+
+class _Result:
+    def __init__(self, text: str):
+        self.session_id, self.result = f"s-{text}", text
+        self.is_error, self.subtype, self.stop_reason = False, "success", "end_turn"
+        self.total_cost_usd, self.duration_ms, self.num_turns = 0.0, 1, 1
+        self.usage, self.model_usage = {}, {}
+        self.permission_denials, self.errors, self.api_error_status = [], [], None
+
+
+def test_concurrent_runs_keep_separate_transcripts(tmp_path: Path, monkeypatch):
+    # Regression: the handle lived on the provider, so when parallel steps
+    # (e.g. forked reviewers) ran at once, the first to finish closed the
+    # others' file and their ResultMessage records were lost.
+    async def fake_query(prompt, options):
+        await asyncio.sleep(0.2 if prompt == "slow" else 0.01)
+        yield _Result(prompt)
+
+    monkeypatch.setattr(provider_mod, "query", fake_query)
+    monkeypatch.setattr(provider_mod, "ResultMessage", _Result)
+    prov = ClaudeProvider()
+
+    async def both():
+        await asyncio.gather(*(
+            prov.run(name, StepRunOptions(step_id=name, transcript_path=str(tmp_path / f"{name}.jsonl")))
+            for name in ("slow", "fast")
+        ))
+
+    asyncio.run(both())
+    for name in ("slow", "fast"):
+        recs = [json.loads(x) for x in (tmp_path / f"{name}.jsonl").read_text().splitlines()]
+        assert [r["kind"] for r in recs] == ["prompt", "_Result"], name
+        assert recs[0]["text"] == name and recs[1]["result"] == name
